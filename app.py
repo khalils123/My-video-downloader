@@ -17,23 +17,32 @@ Env vars (see README): DOWNLOAD_DIR,
 MAX_CONCURRENT (default 2), FILE_TTL_MIN (default 120).
 Needs on the server: python3, ffmpeg, and yt-dlp (installed in the venv).
 """
-import os, re, json, time, uuid, shutil, sqlite3, threading, subprocess
+import os, re, json, time, uuid, shutil, socket, ipaddress, sqlite3, threading, subprocess
 from flask import (Flask, request, jsonify,
                    send_file, render_template_string, abort)
 
-DOWNLOAD_DIR   = os.environ.get("DOWNLOAD_DIR", "/var/lib/vidcapture")
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "2"))
-FILE_TTL_MIN   = int(os.environ.get("FILE_TTL_MIN", "120"))
-YTDLP          = shutil.which("yt-dlp") or "yt-dlp"
-FFMPEG         = shutil.which("ffmpeg") or "ffmpeg"
-
+DOWNLOAD_DIR        = os.environ.get("DOWNLOAD_DIR", "/var/lib/vidcapture")
+MAX_CONCURRENT      = int(os.environ.get("MAX_CONCURRENT", "2"))
+FILE_TTL_MIN        = int(os.environ.get("FILE_TTL_MIN", "120"))
+YTDLP               = shutil.which("yt-dlp") or "yt-dlp"
+FFMPEG              = shutil.which("ffmpeg") or "ffmpeg"
+MAX_URLS_PER_REQUEST = int(os.environ.get("MAX_URLS_PER_REQUEST", "10"))
+DOWNLOAD_TIMEOUT_SEC = int(os.environ.get("DOWNLOAD_TIMEOUT_SEC", "1800"))
+CONVERT_TIMEOUT_SEC  = int(os.environ.get("CONVERT_TIMEOUT_SEC", "600"))
+RATE_LIMIT_MAX       = int(os.environ.get("RATE_LIMIT_MAX", "5"))
+RATE_LIMIT_WINDOW_SEC = int(os.environ.get("RATE_LIMIT_WINDOW_SEC", "60"))
+MIN_FREE_DISK_MB    = int(os.environ.get("MIN_FREE_DISK_MB", "1024"))
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024  # 1MB: plenty for a list of URLs
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 DB = os.path.join(DOWNLOAD_DIR, "library.db")
 
 jobs = {}
 sem = threading.Semaphore(MAX_CONCURRENT)
+
+_rate_lock = threading.Lock()
+_rate_hits = {}
 
 FORMATS = {
     "1080": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
@@ -58,6 +67,44 @@ def init_db():
 init_db()
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+def client_ip():
+    return request.headers.get("X-Real-IP") or request.remote_addr or "unknown"
+
+def rate_limited(ip):
+    now = time.time()
+    with _rate_lock:
+        hits = _rate_hits.setdefault(ip, [])
+        hits[:] = [t for t in hits if now - t < RATE_LIMIT_WINDOW_SEC]
+        if len(hits) >= RATE_LIMIT_MAX:
+            return True
+        hits.append(now)
+        return False
+
+def has_disk_space():
+    try:
+        return shutil.disk_usage(DOWNLOAD_DIR).free >= MIN_FREE_DISK_MB * 1024 * 1024
+    except OSError:
+        return True
+
+def is_safe_url(url):
+    m = re.match(r"^https?://([^/:?#]+)", url)
+    if not m:
+        return False
+    host = m.group(1)
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            return False
+    return True
+
 def load_meta(outdir):
     for f in os.listdir(outdir):
         if f.endswith(".info.json"):
@@ -100,7 +147,11 @@ def convert_aspect(src, dst, ratio, mode):
               "[bgb][fgs]overlay=(W-w)/2:(H-h)/2" % (W, H, W, H, W, H))
         cmd = [FFMPEG, "-y", "-i", src, "-filter_complex", fc, "-map", "0:a?",
                "-c:a", "aac", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", dst]
-    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+    try:
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=CONVERT_TIMEOUT_SEC).returncode
+    except subprocess.TimeoutExpired:
+        return -1
 
 def run_job(job_id):
     with sem:
@@ -125,17 +176,24 @@ def run_job(job_id):
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True, bufsize=1)
-            for line in proc.stdout:
-                m = re.search(r"(\d{1,3}(?:\.\d)?)%", line)
-                if m:
-                    try:
-                        job["progress"] = min(99.0, float(m.group(1)))
-                    except ValueError:
-                        pass
-            proc.wait()
+            timer = threading.Timer(DOWNLOAD_TIMEOUT_SEC, proc.kill)
+            timer.start()
+            try:
+                for line in proc.stdout:
+                    m = re.search(r"(\d{1,3}(?:\.\d)?)%", line)
+                    if m:
+                        try:
+                            job["progress"] = min(99.0, float(m.group(1)))
+                        except ValueError:
+                            pass
+                proc.wait()
+            finally:
+                timed_out = not timer.is_alive()
+                timer.cancel()
             if proc.returncode != 0:
                 job["status"] = "error"
-                job["error"] = ("Download failed. The site may be unsupported, or the link "
+                job["error"] = ("Download timed out." if timed_out else
+                                "Download failed. The site may be unsupported, or the link "
                                 "is protected/expired/region-locked.")
                 return
 
@@ -199,8 +257,12 @@ def index():
 
 @app.post("/api/jobs")
 def submit():
+    if rate_limited(client_ip()):
+        return jsonify({"error": "Too many requests. Please slow down and try again shortly."}), 429
+    if not has_disk_space():
+        return jsonify({"error": "Server storage is full. Try again later."}), 507
     data = request.get_json(silent=True) or {}
-    urls = data.get("urls") or []
+    urls = (data.get("urls") or [])[:MAX_URLS_PER_REQUEST]
     fmt = data.get("format", "1080")
     if fmt not in FORMATS:
         fmt = "1080"
@@ -212,6 +274,8 @@ def submit():
     for u in urls:
         u = (u or "").strip()
         if not re.match(r"^https?://", u):
+            continue
+        if not is_safe_url(u):
             continue
         jid = uuid.uuid4().hex[:12]
         jobs[jid] = {"id": jid, "url": u, "format": fmt, "convert": convert,
@@ -350,6 +414,7 @@ APP_HTML = """<!doctype html><html><head><meta charset="utf-8">
    <button class="btn" id="go">Download</button>
   </div>
   <p class="note">Server downloads, embeds metadata, and (optionally) reframes each file. A Save button appears when it's ready.</p>
+  <p class="err" id="submitErr"></p>
  </div>
 
  <div id="jobs"></div>
@@ -370,9 +435,15 @@ async function submit(){
   const urls=$('#urls').value.split(/\\s+/).map(s=>s.trim()).filter(Boolean);
   if(!urls.length) return;
   $('#go').disabled=true;
+  $('#submitErr').textContent='';
   try{
-    await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},
+    const r=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({urls,format:$('#fmt').value,convert:$('#conv').value,convert_mode:$('#cmode').value,captions:$('#caps').checked})});
+    if(!r.ok){
+      const d=await r.json().catch(()=>({}));
+      $('#submitErr').textContent=d.error||'Something went wrong. Please try again.';
+      return;
+    }
     $('#urls').value='';
   }finally{$('#go').disabled=false;}
   poll();
