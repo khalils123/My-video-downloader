@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Private Video Capture v2 — login-gated yt-dlp downloader for your OWN or licensed content.
+Private Video Capture v2 — yt-dlp downloader for your OWN or licensed content.
 
 Adds on top of v1:
   • Metadata      — yt-dlp --write-info-json + --embed-metadata, indexed in SQLite so you
@@ -13,17 +13,14 @@ Deliberately NOT included: watermark removal. (Removing platform/creator marks f
 downloaded video is misappropriation + a platform-ToS violation; if it's your own content
 you already have the clean master.) A watermark *adder* for your own footage can be added.
 
-Env vars (see README): APP_PASSWORD (required), SECRET_KEY, DOWNLOAD_DIR,
+Env vars (see README): DOWNLOAD_DIR,
 MAX_CONCURRENT (default 2), FILE_TTL_MIN (default 120).
 Needs on the server: python3, ffmpeg, and yt-dlp (installed in the venv).
 """
 import os, re, json, time, uuid, shutil, sqlite3, threading, subprocess
-from functools import wraps
-from flask import (Flask, request, session, redirect, url_for, jsonify,
+from flask import (Flask, request, jsonify,
                    send_file, render_template_string, abort)
 
-APP_PASSWORD   = os.environ.get("APP_PASSWORD", "")
-SECRET_KEY     = os.environ.get("SECRET_KEY", "") or os.urandom(32).hex()
 DOWNLOAD_DIR   = os.environ.get("DOWNLOAD_DIR", "/var/lib/vidcapture")
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "2"))
 FILE_TTL_MIN   = int(os.environ.get("FILE_TTL_MIN", "120"))
@@ -32,7 +29,6 @@ FFMPEG         = shutil.which("ffmpeg") or "ffmpeg"
 
 
 app = Flask(__name__)
-app.secret_key = SECRET_KEY
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 DB = os.path.join(DOWNLOAD_DIR, "library.db")
 
@@ -62,9 +58,6 @@ def init_db():
 init_db()
 
 # ── helpers ──────────────────────────────────────────────────────────────────
-def login_required(f):
-    return f
-
 def load_meta(outdir):
     for f in os.listdir(outdir):
         if f.endswith(".info.json"):
@@ -200,27 +193,11 @@ def cleanup_loop():
 threading.Thread(target=cleanup_loop, daemon=True).start()
 
 # ── routes ────────────────────────────────────────────────────────────────────
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    error = None
-    if request.method == "POST":
-        if request.form.get("password", "") == APP_PASSWORD:
-            session["auth"] = True
-            return redirect(url_for("index"))
-        error = "Wrong password."
-    return render_template_string(LOGIN_HTML, error=error)
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
-
 @app.route("/")
 def index():
     return render_template_string(APP_HTML)
 
 @app.post("/api/jobs")
-@login_required
 def submit():
     data = request.get_json(silent=True) or {}
     urls = data.get("urls") or []
@@ -247,7 +224,6 @@ def submit():
     return jsonify({"created": created})
 
 @app.get("/api/jobs")
-@login_required
 def list_jobs():
     keys = ("id", "url", "status", "progress", "filename", "error", "size", "meta", "subs")
     out = [{k: j.get(k) for k in keys}
@@ -255,14 +231,12 @@ def list_jobs():
     return jsonify({"jobs": out})
 
 @app.post("/api/jobs/<jid>/delete")
-@login_required
 def delete_job(jid):
     jobs.pop(jid, None)
     shutil.rmtree(os.path.join(DOWNLOAD_DIR, jid), ignore_errors=True)
     return jsonify({"ok": True})
 
 @app.get("/api/jobs/<jid>/file")
-@login_required
 def download(jid):
     j = jobs.get(jid)
     if not j or j.get("status") != "done" or not j.get("file"):
@@ -273,7 +247,6 @@ def download(jid):
     return send_file(path, as_attachment=True, download_name=j["filename"])
 
 @app.get("/api/jobs/<jid>/sub/<int:idx>")
-@login_required
 def sub(jid, idx):
     j = jobs.get(jid)
     if not j:
@@ -287,7 +260,6 @@ def sub(jid, idx):
     return send_file(path, as_attachment=True, download_name=subs[idx])
 
 @app.get("/api/library")
-@login_required
 def library():
     q = (request.args.get("q") or "").strip()
     with db() as c:
@@ -347,24 +319,11 @@ a.dl{display:inline-block;margin-top:8px;background:#35D6A0;color:#04231a;font-w
 .subdl:hover{border-color:#3a4a6b}
 """
 
-LOGIN_HTML = """<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in</title>
-<style>""" + BASE_CSS + """.wrap{max-width:380px;padding-top:12vh}</style></head>
-<body><div class="wrap">
-<div class="eyebrow">PRIVATE CAPTURE</div><h1>Sign in</h1>
-<p class="sub">This tool is private.</p>
-<form method="post" class="card">
- <input type="password" name="password" placeholder="Password" style="width:100%" autofocus>
- {% if error %}<p class="err">{{ error }}</p>{% endif %}
- <div class="controls"><button class="btn" type="submit" style="margin-left:0">Enter</button></div>
-</form></div></body></html>"""
-
 APP_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Private Video Capture</title>
 <style>""" + BASE_CSS + """</style></head>
 <body><div class="wrap">
- <div class="top"><div><div class="eyebrow">PRIVATE CAPTURE</div><h1>Video Capture</h1></div>
-  <a class="btn ghost" href="/logout">Sign out</a></div>
+ <div class="top"><div><div class="eyebrow">PRIVATE CAPTURE</div><h1>Video Capture</h1></div></div>
  <div class="banner">For content you own or are licensed to download — your own uploads, client or product footage, and public-domain / Creative-Commons material.</div>
  <div class="card">
   <textarea id="urls" placeholder="Paste one or more links, one per line…"></textarea>
@@ -450,7 +409,7 @@ function doneExtra(j){
 }
 async function del(id){await fetch('/api/jobs/'+id+'/delete',{method:'POST'});poll();}
 async function poll(){
-  try{const r=await fetch('/api/jobs');if(r.status===401){location='/login';return;}
+  try{const r=await fetch('/api/jobs');
     const d=await r.json();render(d.jobs||[]);
     if((d.jobs||[]).some(j=>['downloading','queued','converting'].includes(j.status))) setTimeout(poll,1500);
   }catch(e){setTimeout(poll,3000);}
