@@ -13,8 +13,13 @@ Deliberately NOT included: watermark removal. (Removing platform/creator marks f
 downloaded video is misappropriation + a platform-ToS violation; if it's your own content
 you already have the clean master.) A watermark *adder* for your own footage can be added.
 
-Env vars (see README): DOWNLOAD_DIR,
-MAX_CONCURRENT (default 2), FILE_TTL_MIN (default 120).
+Env vars (see README): DOWNLOAD_DIR, MAX_CONCURRENT (default 2),
+FILE_TTL_MIN (default 60), MAX_URLS_PER_REQUEST (default 10),
+DOWNLOAD_TIMEOUT_SEC (default 1800), CONVERT_TIMEOUT_SEC (default 600),
+RATE_LIMIT_MAX / RATE_LIMIT_WINDOW_SEC (default 5 per 60s per IP),
+MIN_FREE_DISK_MB (default 1024), ALLOWED_DOMAINS (comma-separated
+hostnames; empty = allow all), MAX_FILE_SIZE_MB (default 2048),
+YTDLP_MAX_RETRIES / YTDLP_RETRY_BACKOFF_SEC (default 2 retries, 5s backoff).
 Needs on the server: python3, ffmpeg, and yt-dlp (installed in the venv).
 """
 import os, re, json, time, uuid, shutil, socket, ipaddress, sqlite3, threading, subprocess
@@ -23,7 +28,7 @@ from flask import (Flask, request, jsonify,
 
 DOWNLOAD_DIR        = os.environ.get("DOWNLOAD_DIR", "/var/lib/vidcapture")
 MAX_CONCURRENT      = int(os.environ.get("MAX_CONCURRENT", "2"))
-FILE_TTL_MIN        = int(os.environ.get("FILE_TTL_MIN", "120"))
+FILE_TTL_MIN        = int(os.environ.get("FILE_TTL_MIN", "60"))
 YTDLP               = shutil.which("yt-dlp") or "yt-dlp"
 FFMPEG              = shutil.which("ffmpeg") or "ffmpeg"
 MAX_URLS_PER_REQUEST = int(os.environ.get("MAX_URLS_PER_REQUEST", "10"))
@@ -32,6 +37,10 @@ CONVERT_TIMEOUT_SEC  = int(os.environ.get("CONVERT_TIMEOUT_SEC", "600"))
 RATE_LIMIT_MAX       = int(os.environ.get("RATE_LIMIT_MAX", "5"))
 RATE_LIMIT_WINDOW_SEC = int(os.environ.get("RATE_LIMIT_WINDOW_SEC", "60"))
 MIN_FREE_DISK_MB    = int(os.environ.get("MIN_FREE_DISK_MB", "1024"))
+ALLOWED_DOMAINS     = [d.strip().lower() for d in os.environ.get("ALLOWED_DOMAINS", "").split(",") if d.strip()]
+MAX_FILE_SIZE_MB    = int(os.environ.get("MAX_FILE_SIZE_MB", "2048"))
+YTDLP_MAX_RETRIES   = int(os.environ.get("YTDLP_MAX_RETRIES", "2"))
+YTDLP_RETRY_BACKOFF_SEC = int(os.environ.get("YTDLP_RETRY_BACKOFF_SEC", "5"))
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024  # 1MB: plenty for a list of URLs
@@ -85,6 +94,15 @@ def has_disk_space():
         return shutil.disk_usage(DOWNLOAD_DIR).free >= MIN_FREE_DISK_MB * 1024 * 1024
     except OSError:
         return True
+
+def domain_allowed(url):
+    if not ALLOWED_DOMAINS:
+        return True
+    m = re.match(r"^https?://([^/:?#]+)", url)
+    if not m:
+        return False
+    host = m.group(1).lower()
+    return any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS)
 
 def is_safe_url(url):
     m = re.match(r"^https?://([^/:?#]+)", url)
@@ -153,6 +171,25 @@ def convert_aspect(src, dst, ratio, mode):
     except subprocess.TimeoutExpired:
         return -1
 
+def _run_ytdlp_once(cmd, job):
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+    timer = threading.Timer(DOWNLOAD_TIMEOUT_SEC, proc.kill)
+    timer.start()
+    try:
+        for line in proc.stdout:
+            m = re.search(r"(\d{1,3}(?:\.\d)?)%", line)
+            if m:
+                try:
+                    job["progress"] = min(99.0, float(m.group(1)))
+                except ValueError:
+                    pass
+        proc.wait()
+    finally:
+        timed_out = not timer.is_alive()
+        timer.cancel()
+    return proc.returncode, timed_out
+
 def run_job(job_id):
     with sem:
         job = jobs.get(job_id)
@@ -165,7 +202,8 @@ def run_job(job_id):
         outtmpl = os.path.join(outdir, "%(title).150B.%(ext)s")
         cmd = [YTDLP, "-f", fmt, "-o", outtmpl, "--no-playlist", "--newline",
                "--restrict-filenames", "--no-mtime", "--no-progress",
-               "--write-info-json", "--embed-metadata"]
+               "--write-info-json", "--embed-metadata",
+               "--max-filesize", "%dM" % MAX_FILE_SIZE_MB]
         if job.get("captions"):
             cmd += ["--write-subs", "--write-auto-subs", "--sub-langs", "all", "--convert-subs", "srt"]
         if job["format"] == "audio":
@@ -174,27 +212,23 @@ def run_job(job_id):
             cmd += ["--merge-output-format", "mp4"]
         cmd.append(job["url"])
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True, bufsize=1)
-            timer = threading.Timer(DOWNLOAD_TIMEOUT_SEC, proc.kill)
-            timer.start()
-            try:
-                for line in proc.stdout:
-                    m = re.search(r"(\d{1,3}(?:\.\d)?)%", line)
-                    if m:
-                        try:
-                            job["progress"] = min(99.0, float(m.group(1)))
-                        except ValueError:
-                            pass
-                proc.wait()
-            finally:
-                timed_out = not timer.is_alive()
-                timer.cancel()
-            if proc.returncode != 0:
+            attempts = YTDLP_MAX_RETRIES + 1
+            returncode, timed_out = 1, False
+            for attempt in range(attempts):
+                job["progress"] = 0.0
+                returncode, timed_out = _run_ytdlp_once(cmd, job)
+                if returncode == 0 or timed_out:
+                    break
+                if attempt < attempts - 1:
+                    job["status"] = "retrying"
+                    time.sleep(YTDLP_RETRY_BACKOFF_SEC)
+                    job["status"] = "downloading"
+            if returncode != 0:
                 job["status"] = "error"
                 job["error"] = ("Download timed out." if timed_out else
-                                "Download failed. The site may be unsupported, or the link "
-                                "is protected/expired/region-locked.")
+                                "Download failed after %d attempt(s). The site may be unsupported, "
+                                "the link protected/expired/region-locked, or the file exceeds the "
+                                "%dMB size cap." % (attempts, MAX_FILE_SIZE_MB))
                 return
 
             media = [f for f in os.listdir(outdir)
@@ -247,6 +281,16 @@ def cleanup_loop():
             if now - j.get("created", now) > FILE_TTL_MIN * 60:
                 shutil.rmtree(os.path.join(DOWNLOAD_DIR, jid), ignore_errors=True)
                 jobs.pop(jid, None)
+        # sweep orphaned job directories left behind by a service restart
+        try:
+            for name in os.listdir(DOWNLOAD_DIR):
+                path = os.path.join(DOWNLOAD_DIR, name)
+                if name in jobs or not os.path.isdir(path):
+                    continue
+                if now - os.path.getmtime(path) > FILE_TTL_MIN * 60:
+                    shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
         time.sleep(300)
 threading.Thread(target=cleanup_loop, daemon=True).start()
 
@@ -275,7 +319,7 @@ def submit():
         u = (u or "").strip()
         if not re.match(r"^https?://", u):
             continue
-        if not is_safe_url(u):
+        if not is_safe_url(u) or not domain_allowed(u):
             continue
         jid = uuid.uuid4().hex[:12]
         jobs[jid] = {"id": jid, "url": u, "format": fmt, "convert": convert,
@@ -367,7 +411,7 @@ textarea:focus,input:focus,select:focus{outline:none;border-color:#F6A73B;box-sh
 .bar.done>i{background:#35D6A0;width:100%}
 .bar.error>i{background:#F2627E;width:100%}
 .st{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:#7C8AA8}
-.st.done{color:#35D6A0}.st.error{color:#F2627E}.st.downloading,.st.converting{color:#F6A73B}
+.st.done{color:#35D6A0}.st.error{color:#F2627E}.st.downloading,.st.converting,.st.retrying{color:#F6A73B}
 .err{color:#F2627E;font-size:12px;margin-top:4px}
 a.dl{display:inline-block;margin-top:8px;background:#35D6A0;color:#04231a;font-weight:700;
  font-size:13px;padding:8px 14px;border-radius:9px;text-decoration:none}
@@ -482,7 +526,7 @@ async function del(id){await fetch('/api/jobs/'+id+'/delete',{method:'POST'});po
 async function poll(){
   try{const r=await fetch('/api/jobs');
     const d=await r.json();render(d.jobs||[]);
-    if((d.jobs||[]).some(j=>['downloading','queued','converting'].includes(j.status))) setTimeout(poll,1500);
+    if((d.jobs||[]).some(j=>['downloading','queued','converting','retrying'].includes(j.status))) setTimeout(poll,1500);
   }catch(e){setTimeout(poll,3000);}
 }
 async function search(){
