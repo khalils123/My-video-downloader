@@ -8,10 +8,9 @@ Adds on top of v1:
   • Aspect ratio  — optional ffmpeg pass to 9:16 / 1:1 / 16:9, center-crop or blurred-pad.
   • Batch audio   — paste many links, pick "Audio only (mp3)".
   • Library search — /api/library?q=... over saved metadata.
-
-Deliberately NOT included: watermark removal. (Removing platform/creator marks from
-downloaded video is misappropriation + a platform-ToS violation; if it's your own content
-you already have the clean master.) A watermark *adder* for your own footage can be added.
+  • Watermark removal — opt-in, corner-preset ffmpeg delogo pass. For YOUR OWN content
+                    only (e.g. cross-posting your own video to another platform without
+                    double branding) — not for stripping other creators' marks.
 
 Env vars (see README): DOWNLOAD_DIR, MAX_CONCURRENT (default 2),
 FILE_TTL_MIN (default 60), MAX_URLS_PER_REQUEST (default 10),
@@ -31,6 +30,8 @@ MAX_CONCURRENT      = int(os.environ.get("MAX_CONCURRENT", "2"))
 FILE_TTL_MIN        = int(os.environ.get("FILE_TTL_MIN", "60"))
 YTDLP               = shutil.which("yt-dlp") or "yt-dlp"
 FFMPEG              = shutil.which("ffmpeg") or "ffmpeg"
+FFPROBE             = shutil.which("ffprobe") or "ffprobe"
+WATERMARK_TIMEOUT_SEC = int(os.environ.get("WATERMARK_TIMEOUT_SEC", "300"))
 MAX_URLS_PER_REQUEST = int(os.environ.get("MAX_URLS_PER_REQUEST", "10"))
 DOWNLOAD_TIMEOUT_SEC = int(os.environ.get("DOWNLOAD_TIMEOUT_SEC", "1800"))
 CONVERT_TIMEOUT_SEC  = int(os.environ.get("CONVERT_TIMEOUT_SEC", "600"))
@@ -60,6 +61,16 @@ FORMATS = {
     "audio": "bestaudio/best",
 }
 CANVAS = {"9x16": (1080, 1920), "1x1": (1080, 1080), "16x9": (1920, 1080)}
+
+# Watermark removal is for YOUR OWN content only (e.g. stripping a platform
+# watermark before cross-posting your own video elsewhere). Regions are
+# fractions (0-1) of frame width/height so they scale to any resolution.
+WATERMARK_PRESETS = {
+    "bl": {"x": 0.02, "y": 0.80, "w": 0.22, "h": 0.16},
+    "br": {"x": 0.76, "y": 0.80, "w": 0.22, "h": 0.16},
+    "tl": {"x": 0.02, "y": 0.04, "w": 0.22, "h": 0.16},
+    "tr": {"x": 0.76, "y": 0.04, "w": 0.22, "h": 0.16},
+}
 
 # ── db ──────────────────────────────────────────────────────────────────────
 def db():
@@ -171,6 +182,34 @@ def convert_aspect(src, dst, ratio, mode):
     except subprocess.TimeoutExpired:
         return -1
 
+def probe_dims(path):
+    cmd = [FFPROBE, "-v", "error", "-select_streams", "v:0",
+           "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", path]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout.strip()
+        w, h = out.split("x")
+        return int(w), int(h)
+    except Exception:
+        return None
+
+def remove_watermark(src, dst, region):
+    dims = probe_dims(src)
+    if not dims:
+        return False
+    W, H = dims
+    x = max(0, int(region["x"] * W))
+    y = max(0, int(region["y"] * H))
+    w = max(2, int(region["w"] * W))
+    h = max(2, int(region["h"] * H))
+    vf = "delogo=x=%d:y=%d:w=%d:h=%d" % (x, y, w, h)
+    cmd = [FFMPEG, "-y", "-i", src, "-vf", vf, "-c:v", "libx264",
+           "-preset", "veryfast", "-crf", "20", "-c:a", "copy", dst]
+    try:
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=WATERMARK_TIMEOUT_SEC).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
 def _run_ytdlp_once(cmd, job):
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -239,6 +278,15 @@ def run_job(job_id):
                 return
             media.sort(key=lambda f: os.path.getsize(os.path.join(outdir, f)), reverse=True)
             primary = os.path.join(outdir, media[0])
+
+            # optional watermark removal (your own content only; video only)
+            wm_pos = job.get("watermark_pos")
+            if job.get("watermark") and wm_pos in WATERMARK_PRESETS and job["format"] != "audio":
+                job["status"] = "watermarking"
+                base = os.path.splitext(media[0])[0]
+                dst = os.path.join(outdir, "%s.nowm.mp4" % base)
+                if remove_watermark(primary, dst, WATERMARK_PRESETS[wm_pos]) and os.path.exists(dst):
+                    primary = dst
 
             # optional aspect-ratio conversion (video only)
             ratio = job.get("convert")
@@ -314,6 +362,9 @@ def submit():
     convert = convert if convert in CANVAS else "none"
     convert_mode = "crop" if data.get("convert_mode") == "crop" else "blur"
     captions = bool(data.get("captions"))
+    watermark = bool(data.get("watermark"))
+    watermark_pos = data.get("watermark_pos", "bl")
+    watermark_pos = watermark_pos if watermark_pos in WATERMARK_PRESETS else "bl"
     created = []
     for u in urls:
         u = (u or "").strip()
@@ -324,6 +375,7 @@ def submit():
         jid = uuid.uuid4().hex[:12]
         jobs[jid] = {"id": jid, "url": u, "format": fmt, "convert": convert,
                      "convert_mode": convert_mode, "captions": captions,
+                     "watermark": watermark, "watermark_pos": watermark_pos,
                      "status": "queued", "progress": 0.0, "file": None,
                      "filename": None, "error": None, "meta": {}, "subs": [],
                      "created": time.time()}
@@ -411,7 +463,7 @@ textarea:focus,input:focus,select:focus{outline:none;border-color:#F6A73B;box-sh
 .bar.done>i{background:#35D6A0;width:100%}
 .bar.error>i{background:#F2627E;width:100%}
 .st{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:#7C8AA8}
-.st.done{color:#35D6A0}.st.error{color:#F2627E}.st.downloading,.st.converting,.st.retrying{color:#F6A73B}
+.st.done{color:#35D6A0}.st.error{color:#F2627E}.st.downloading,.st.converting,.st.retrying,.st.watermarking{color:#F6A73B}
 .err{color:#F2627E;font-size:12px;margin-top:4px}
 a.dl{display:inline-block;margin-top:8px;background:#35D6A0;color:#04231a;font-weight:700;
  font-size:13px;padding:8px 14px;border-radius:9px;text-decoration:none}
@@ -432,7 +484,7 @@ APP_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <style>""" + BASE_CSS + """</style></head>
 <body><div class="wrap">
  <div class="top"><div><div class="eyebrow">PRIVATE CAPTURE</div><h1>Video Capture</h1></div></div>
- <div class="banner">For content you own or are licensed to download — your own uploads, client or product footage, and public-domain / Creative-Commons material.</div>
+ <div class="banner">For content you own or are licensed to download — your own uploads, client or product footage, and public-domain / Creative-Commons material. Watermark removal is for your own content only (e.g. cross-posting your own video to another platform).</div>
  <div class="card">
   <textarea id="urls" placeholder="Paste one or more links, one per line…"></textarea>
   <div class="controls">
@@ -455,6 +507,13 @@ APP_HTML = """<!doctype html><html><head><meta charset="utf-8">
     <option value="crop">Center crop</option>
    </select>
    <label style="display:flex;align-items:center;gap:6px;margin-left:2px"><input type="checkbox" id="caps" style="width:auto;accent-color:#F6A73B"> Captions</label>
+   <label style="display:flex;align-items:center;gap:6px;margin-left:2px"><input type="checkbox" id="wm" style="width:auto;accent-color:#F6A73B"> Remove watermark (own content only)</label>
+   <select id="wmpos">
+    <option value="bl">Bottom-left</option>
+    <option value="br">Bottom-right</option>
+    <option value="tl">Top-left</option>
+    <option value="tr">Top-right</option>
+   </select>
    <button class="btn" id="go">Download</button>
   </div>
   <p class="note">Server downloads, embeds metadata, and (optionally) reframes each file. A Save button appears when it's ready.</p>
@@ -482,7 +541,7 @@ async function submit(){
   $('#submitErr').textContent='';
   try{
     const r=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({urls,format:$('#fmt').value,convert:$('#conv').value,convert_mode:$('#cmode').value,captions:$('#caps').checked})});
+      body:JSON.stringify({urls,format:$('#fmt').value,convert:$('#conv').value,convert_mode:$('#cmode').value,captions:$('#caps').checked,watermark:$('#wm').checked,watermark_pos:$('#wmpos').value})});
     if(!r.ok){
       const d=await r.json().catch(()=>({}));
       $('#submitErr').textContent=d.error||'Something went wrong. Please try again.';
@@ -526,7 +585,7 @@ async function del(id){await fetch('/api/jobs/'+id+'/delete',{method:'POST'});po
 async function poll(){
   try{const r=await fetch('/api/jobs');
     const d=await r.json();render(d.jobs||[]);
-    if((d.jobs||[]).some(j=>['downloading','queued','converting','retrying'].includes(j.status))) setTimeout(poll,1500);
+    if((d.jobs||[]).some(j=>['downloading','queued','converting','retrying','watermarking'].includes(j.status))) setTimeout(poll,1500);
   }catch(e){setTimeout(poll,3000);}
 }
 async function search(){
