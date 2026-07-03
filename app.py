@@ -60,7 +60,7 @@ FORMATS = {
     "best": "bestvideo+bestaudio/best",
     "audio": "bestaudio/best",
 }
-CANVAS = {"9x16": (1080, 1920), "1x1": (1080, 1080), "16x9": (1920, 1080)}
+CANVAS = {"9x16": (720, 1280), "1x1": (720, 720), "16x9": (1280, 720)}
 
 # Watermark removal is for YOUR OWN content only (e.g. stripping a platform
 # watermark before cross-posting your own video elsewhere). Regions are
