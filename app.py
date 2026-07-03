@@ -169,13 +169,16 @@ def convert_aspect(src, dst, ratio, mode):
         vf = "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d" % (W, H, W, H)
         cmd = [FFMPEG, "-y", "-i", src, "-vf", vf, "-c:a", "copy",
                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", dst]
-    else:  # blurred-pad background
+    else:  # blurred-pad background — blur a downscaled copy, then scale back up (much cheaper
+           # than blurring at full resolution: ~16x fewer pixels, single-pass boxblur)
+        sw, sh = max(2, W // 4), max(2, H // 4)
         fc = ("split=2[bg][fg];"
-              "[bg]scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,boxblur=20:4[bgb];"
+              "[bg]scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,"
+              "boxblur=6:1,scale=%d:%d[bgb];"
               "[fg]scale=%d:%d:force_original_aspect_ratio=decrease[fgs];"
-              "[bgb][fgs]overlay=(W-w)/2:(H-h)/2" % (W, H, W, H, W, H))
+              "[bgb][fgs]overlay=(W-w)/2:(H-h)/2" % (sw, sh, sw, sh, W, H, W, H))
         cmd = [FFMPEG, "-y", "-i", src, "-filter_complex", fc, "-map", "0:a?",
-               "-c:a", "aac", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", dst]
+               "-c:a", "aac", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", dst]
     try:
         return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                               timeout=CONVERT_TIMEOUT_SEC).returncode
