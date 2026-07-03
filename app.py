@@ -168,7 +168,7 @@ def convert_aspect(src, dst, ratio, mode):
     if mode == "crop":
         vf = "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d" % (W, H, W, H)
         cmd = [FFMPEG, "-y", "-i", src, "-vf", vf, "-c:a", "copy",
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", dst]
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "0", dst]
     else:  # blurred-pad background — blur a downscaled copy, then scale back up (much cheaper
            # than blurring at full resolution: ~16x fewer pixels, single-pass boxblur)
         sw, sh = max(2, W // 4), max(2, H // 4)
@@ -178,7 +178,8 @@ def convert_aspect(src, dst, ratio, mode):
               "[fg]scale=%d:%d:force_original_aspect_ratio=decrease[fgs];"
               "[bgb][fgs]overlay=(W-w)/2:(H-h)/2" % (sw, sh, sw, sh, W, H, W, H))
         cmd = [FFMPEG, "-y", "-i", src, "-filter_complex", fc, "-map", "0:a?",
-               "-c:a", "aac", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", dst]
+               "-c:a", "aac", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+               "-threads", "0", dst]
     try:
         return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                               timeout=CONVERT_TIMEOUT_SEC).returncode
