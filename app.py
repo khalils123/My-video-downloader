@@ -446,7 +446,11 @@ def run_job(job_id):
             return
 
         images, videos, audios = classify_outdir(outdir)
-        is_slideshow = len(images) >= 2 and not videos
+        # A stray image alongside a real video is treated as a thumbnail and
+        # ignored (see the else branch below). But with no video at all, any
+        # image(s) present are the actual content — a photo post can be a
+        # single photo, not just multi-image slideshows.
+        is_slideshow = bool(images) and not videos
 
         if is_slideshow:
             # TikTok/Instagram "photo mode" post: bundle images (+ any audio
