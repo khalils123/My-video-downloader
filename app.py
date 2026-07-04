@@ -66,6 +66,7 @@ ALLOWED_DOMAINS     = [d.strip().lower() for d in os.environ.get("ALLOWED_DOMAIN
 MAX_FILE_SIZE_MB    = int(os.environ.get("MAX_FILE_SIZE_MB", "2048"))
 YTDLP_MAX_RETRIES   = int(os.environ.get("YTDLP_MAX_RETRIES", "2"))
 YTDLP_RETRY_BACKOFF_SEC = int(os.environ.get("YTDLP_RETRY_BACKOFF_SEC", "5"))
+PREVIEW_TIMEOUT_SEC = int(os.environ.get("PREVIEW_TIMEOUT_SEC", "20"))
 REDIS_HOST          = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT          = int(os.environ.get("REDIS_PORT", "6379"))
 REDIS_DB            = int(os.environ.get("REDIS_DB", "0"))
@@ -545,6 +546,38 @@ if not os.environ.get("VIDCAPTURE_WORKER"):
 def index():
     return render_template_string(APP_HTML)
 
+@app.post("/api/preview")
+def preview():
+    if rate_limited(client_ip()):
+        return jsonify({"error": "Too many requests. Please slow down and try again shortly."}), 429
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    if not re.match(r"^https?://", url):
+        return jsonify({"error": "Invalid URL"}), 400
+    if not is_safe_url(url) or not domain_allowed(url):
+        return jsonify({"error": "This URL isn't allowed"}), 400
+    cmd = [YTDLP, "-j", "--no-playlist", "--skip-download", "--no-warnings", url]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=PREVIEW_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Preview timed out"}), 504
+    except OSError:
+        return jsonify({"error": "Preview unavailable"}), 500
+    if proc.returncode != 0:
+        return jsonify({"error": "Couldn't fetch a preview for this link"}), 422
+    try:
+        lines = [l for l in proc.stdout.strip().splitlines() if l.strip()]
+        info = json.loads(lines[-1]) if lines else {}
+    except (ValueError, IndexError):
+        return jsonify({"error": "Couldn't parse preview data"}), 422
+    return jsonify({
+        "title": info.get("title"),
+        "thumbnail": info.get("thumbnail"),
+        "duration": info.get("duration"),
+        "uploader": info.get("uploader") or info.get("channel"),
+        "view_count": info.get("view_count"),
+    })
+
 @app.post("/api/jobs")
 def submit():
     if rate_limited(client_ip()):
@@ -648,89 +681,121 @@ def library():
 
 # ── templates ──────────────────────────────────────────────────────────────────
 BASE_CSS = """
+:root{
+ --bg:#0E1524; --fg:#E6EBF5; --accent:#F6A73B; --accent-shadow:rgba(246,167,59,.16);
+ --muted:#7C8AA8; --card:#161F33; --border:#2A3853; --border-hover:#3a4a6b;
+ --btn-fg:#241605; --done:#35D6A0; --done-fg:#04231a; --error:#F2627E;
+ --banner-bg:rgba(246,167,59,.10); --banner-border:rgba(246,167,59,.3); --banner-fg:#F6C77B;
+ --link:#7FA8FF; --glow:rgba(91,157,255,.10);
+}
+:root[data-theme="light"]{
+ --bg:#F5F7FB; --fg:#1B2333; --accent:#B9720A; --accent-shadow:rgba(185,114,10,.16);
+ --muted:#5B6B8C; --card:#FFFFFF; --border:#DCE3F0; --border-hover:#B9C4D9;
+ --btn-fg:#241605; --done:#1E9E73; --done-fg:#eafff5; --error:#C23A54;
+ --banner-bg:rgba(185,114,10,.08); --banner-border:rgba(185,114,10,.25); --banner-fg:#7A4A06;
+ --link:#2A5FD9; --glow:rgba(91,157,255,.06);
+}
 *{box-sizing:border-box}
-body{margin:0;min-height:100vh;background:#0E1524;color:#E6EBF5;
- font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
- background-image:radial-gradient(1000px 500px at 80% -10%,rgba(91,157,255,.10),transparent 60%);}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--fg);
+ font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Nastaliq Urdu",sans-serif;
+ background-image:radial-gradient(1000px 500px at 80% -10%,var(--glow),transparent 60%);
+ transition:background-color .2s,color .2s}
 .wrap{max-width:880px;margin:0 auto;padding:26px 18px 60px}
-.eyebrow{font-size:11px;letter-spacing:.3em;color:#F6A73B;font-weight:600}
+.eyebrow{font-size:11px;letter-spacing:.3em;color:var(--accent);font-weight:600}
 h1{font-size:26px;font-weight:800;letter-spacing:-.02em;margin:6px 0 2px}
-.sub{color:#7C8AA8;font-size:13px;margin-bottom:20px}
-.card{background:#161F33;border:1px solid #2A3853;border-radius:14px;padding:16px;margin-bottom:14px}
-textarea,input,select{background:#0E1524;color:#E6EBF5;border:1px solid #2A3853;
+.sub{color:var(--muted);font-size:13px;margin-bottom:20px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;margin-bottom:14px}
+textarea,input,select{background:var(--bg);color:var(--fg);border:1px solid var(--border);
  border-radius:10px;padding:11px 12px;font-size:14px;font-family:inherit}
 textarea{width:100%;min-height:92px;resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
-textarea:focus,input:focus,select:focus{outline:none;border-color:#F6A73B;box-shadow:0 0 0 3px rgba(246,167,59,.16)}
+textarea:focus,input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-shadow)}
 .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:11px;align-items:center}
-.controls label{font-size:11px;color:#7C8AA8;margin-right:2px}
-.btn{background:#F6A73B;color:#241605;border:none;font-weight:700;font-size:14px;
+.controls label{font-size:11px;color:var(--muted);margin-right:2px}
+.btn{background:var(--accent);color:var(--btn-fg);border:none;font-weight:700;font-size:14px;
  padding:11px 18px;border-radius:10px;cursor:pointer;margin-left:auto}
-.btn.ghost{background:transparent;color:#E6EBF5;border:1px solid #2A3853;font-weight:600;margin-left:0}
+.btn.ghost{background:transparent;color:var(--fg);border:1px solid var(--border);font-weight:600;margin-left:0}
 .btn:disabled{opacity:.5;cursor:not-allowed}
-.note{font-size:12px;color:#7C8AA8;line-height:1.5;margin-top:10px}
-.job{background:#161F33;border:1px solid #2A3853;border-radius:12px;padding:12px 13px;margin-bottom:9px}
-.job .u{font-size:12px;color:#7C8AA8;font-family:ui-monospace,monospace;word-break:break-all}
+.note{font-size:12px;color:var(--muted);line-height:1.5;margin-top:10px}
+.job{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px 13px;margin-bottom:9px}
+.job .u{font-size:12px;color:var(--muted);font-family:ui-monospace,monospace;word-break:break-all}
 .job .t{font-size:13.5px;font-weight:600;margin-bottom:3px;word-break:break-all}
-.meta{font-size:11px;color:#8A98B6;margin-top:3px}
-.bar{height:6px;background:#0E1524;border:1px solid #2A3853;border-radius:3px;overflow:hidden;margin:8px 0}
-.bar>i{display:block;height:100%;background:#F6A73B;width:0;transition:width .3s}
-.bar.done>i{background:#35D6A0;width:100%}
-.bar.error>i{background:#F2627E;width:100%}
-.st{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:#7C8AA8}
-.st.done{color:#35D6A0}.st.error{color:#F2627E}.st.downloading,.st.converting,.st.retrying,.st.watermarking,.st.packaging{color:#F6A73B}
-.err{color:#F2627E;font-size:12px;margin-top:4px}
-a.dl{display:inline-block;margin-top:8px;background:#35D6A0;color:#04231a;font-weight:700;
+.meta{font-size:11px;color:var(--muted);margin-top:3px}
+.bar{height:6px;background:var(--bg);border:1px solid var(--border);border-radius:3px;overflow:hidden;margin:8px 0}
+.bar>i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s}
+.bar.done>i{background:var(--done);width:100%}
+.bar.error>i{background:var(--error);width:100%}
+.st{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}
+.st.done{color:var(--done)}.st.error{color:var(--error)}.st.downloading,.st.converting,.st.retrying,.st.watermarking,.st.packaging{color:var(--accent)}
+.err{color:var(--error);font-size:12px;margin-top:4px}
+a.dl{display:inline-block;margin-top:8px;background:var(--done);color:var(--done-fg);font-weight:700;
  font-size:13px;padding:8px 14px;border-radius:9px;text-decoration:none}
-.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
-.banner{background:rgba(246,167,59,.10);border:1px solid rgba(246,167,59,.3);color:#F6C77B;
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:10px}
+.toggles{display:flex;gap:8px;flex-shrink:0}
+.toggles .btn.ghost{padding:8px 12px;font-size:12px}
+.banner{background:var(--banner-bg);border:1px solid var(--banner-border);color:var(--banner-fg);
  font-size:12px;padding:9px 12px;border-radius:10px;margin-bottom:16px;line-height:1.5}
-.libitem{border-bottom:1px solid #22304c;padding:8px 0;font-size:13px}
-.libitem .m{font-size:11px;color:#7C8AA8}
-.tags{margin-top:7px;font-size:12px;color:#7FA8FF;line-height:1.6;word-break:break-word}
-.subrow{margin-top:7px;font-size:12px;color:#7C8AA8}
-.subdl{display:inline-block;margin:3px 6px 0 0;background:#0E1524;border:1px solid #2A3853;
- color:#E6EBF5;font-size:12px;padding:5px 10px;border-radius:8px;text-decoration:none;cursor:pointer}
-.subdl:hover{border-color:#3a4a6b}
+.libitem{border-bottom:1px solid var(--border);padding:8px 0;font-size:13px}
+.libitem .m{font-size:11px;color:var(--muted)}
+.tags{margin-top:7px;font-size:12px;color:var(--link);line-height:1.6;word-break:break-word}
+.subrow{margin-top:7px;font-size:12px;color:var(--muted)}
+.subdl{display:inline-block;margin:3px 6px 0 0;background:var(--bg);border:1px solid var(--border);
+ color:var(--fg);font-size:12px;padding:5px 10px;border-radius:8px;text-decoration:none;cursor:pointer}
+.subdl:hover{border-color:var(--border-hover)}
+.preview{display:flex;gap:10px;align-items:center;background:var(--bg);border:1px solid var(--border);
+ border-radius:10px;padding:8px 10px;margin-top:8px}
+.preview img{width:52px;height:52px;object-fit:cover;border-radius:6px;flex-shrink:0;background:var(--border)}
+.preview .pinfo{flex:1;min-width:0}
+.preview .ptitle{font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.preview .pmeta{font-size:11px;color:var(--muted)}
+.preview .premove{cursor:pointer;color:var(--muted);font-size:16px;padding:0 4px;flex-shrink:0}
+.preview .premove:hover{color:var(--error)}
 """
 
 APP_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Private Video Capture</title>
 <style>""" + BASE_CSS + """</style></head>
 <body><div class="wrap">
- <div class="top"><div><div class="eyebrow">PRIVATE CAPTURE</div><h1>Video Capture</h1></div></div>
- <div class="banner">For content you own or are licensed to download — your own uploads, client or product footage, and public-domain / Creative-Commons material. Watermark removal is for your own content only (e.g. cross-posting your own video to another platform).</div>
+ <div class="top">
+  <div><div class="eyebrow" data-i18n="eyebrow">PRIVATE CAPTURE</div><h1 data-i18n="title">Video Capture</h1></div>
+  <div class="toggles">
+   <button class="btn ghost" id="theme-toggle" title="Toggle theme">🌙</button>
+   <button class="btn ghost" id="lang-toggle">اردو</button>
+  </div>
+ </div>
+ <div class="banner" data-i18n="banner">For content you own or are licensed to download — your own uploads, client or product footage, and public-domain / Creative-Commons material. Watermark removal is for your own content only (e.g. cross-posting your own video to another platform).</div>
  <div class="card">
-  <textarea id="urls" placeholder="Paste one or more links, one per line…"></textarea>
+  <textarea id="urls" data-i18n-ph="urls_ph" placeholder="Paste one or more links, one per line…"></textarea>
+  <div id="previews"></div>
   <div class="controls">
-   <label>Quality</label>
+   <label data-i18n="quality">Quality</label>
    <select id="fmt">
-    <option value="1080">Up to 1080p</option>
-    <option value="720">Up to 720p</option>
-    <option value="best">Best</option>
-    <option value="audio">Audio (mp3)</option>
+    <option value="1080" data-i18n="fmt_1080">Up to 1080p</option>
+    <option value="720" data-i18n="fmt_720">Up to 720p</option>
+    <option value="best" data-i18n="fmt_best">Best</option>
+    <option value="audio" data-i18n="fmt_audio">Audio (mp3)</option>
    </select>
-   <label>Reframe</label>
+   <label data-i18n="reframe">Reframe</label>
    <select id="conv">
-    <option value="none">Keep original</option>
-    <option value="9x16">9:16 (Reels/TikTok)</option>
-    <option value="1x1">1:1 (Square)</option>
-    <option value="16x9">16:9 (YouTube)</option>
+    <option value="none" data-i18n="conv_none">Keep original</option>
+    <option value="9x16" data-i18n="conv_9x16">9:16 (Reels/TikTok)</option>
+    <option value="1x1" data-i18n="conv_1x1">1:1 (Square)</option>
+    <option value="16x9" data-i18n="conv_16x9">16:9 (YouTube)</option>
    </select>
    <select id="cmode">
-    <option value="blur">Blurred pad</option>
-    <option value="crop">Center crop</option>
+    <option value="blur" data-i18n="cmode_blur">Blurred pad</option>
+    <option value="crop" data-i18n="cmode_crop">Center crop</option>
    </select>
-   <label style="display:flex;align-items:center;gap:6px;margin-left:2px"><input type="checkbox" id="caps" style="width:auto;accent-color:#F6A73B"> Captions</label>
-   <label style="display:flex;align-items:center;gap:6px;margin-left:2px"><input type="checkbox" id="wm" style="width:auto;accent-color:#F6A73B"> Remove watermark (own content only)</label>
+   <label style="display:flex;align-items:center;gap:6px;margin-left:2px"><input type="checkbox" id="caps" style="width:auto;accent-color:#F6A73B"> <span data-i18n="captions_label">Captions</span></label>
+   <label style="display:flex;align-items:center;gap:6px;margin-left:2px"><input type="checkbox" id="wm" style="width:auto;accent-color:#F6A73B"> <span data-i18n="watermark_label">Remove watermark (own content only)</span></label>
    <select id="wmpos">
-    <option value="bl">Bottom-left</option>
-    <option value="br">Bottom-right</option>
-    <option value="tl">Top-left</option>
-    <option value="tr">Top-right</option>
+    <option value="bl" data-i18n="wmpos_bl">Bottom-left</option>
+    <option value="br" data-i18n="wmpos_br">Bottom-right</option>
+    <option value="tl" data-i18n="wmpos_tl">Top-left</option>
+    <option value="tr" data-i18n="wmpos_tr">Top-right</option>
    </select>
-   <button class="btn" id="go">Download</button>
+   <button class="btn" id="go" data-i18n="btn_download">Download</button>
   </div>
-  <p class="note">Server downloads, embeds metadata, and (optionally) reframes each file. A Save button appears when it's ready.</p>
+  <p class="note" data-i18n="note_text">Server downloads, embeds metadata, and (optionally) reframes each file. A Save button appears when it's ready.</p>
   <p class="err" id="submitErr"></p>
  </div>
 
@@ -738,8 +803,8 @@ APP_HTML = """<!doctype html><html><head><meta charset="utf-8">
 
  <div class="card">
   <div class="controls" style="margin-top:0">
-   <input id="q" placeholder="Search your library (title, uploader, tag)" style="flex:1">
-   <button class="btn ghost" id="search">Search</button>
+   <input id="q" data-i18n-ph="lib_ph" placeholder="Search your library (title, uploader, tag)" style="flex:1">
+   <button class="btn ghost" id="search" data-i18n="btn_search">Search</button>
   </div>
   <div id="lib" class="note"></div>
  </div>
@@ -748,6 +813,110 @@ APP_HTML = """<!doctype html><html><head><meta charset="utf-8">
 const $=s=>document.querySelector(s);
 function esc(s){return (s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmtSize(b){if(!b)return'';const u=['B','KB','MB','GB'];let i=0,n=b;while(n>=1024&&i<3){n/=1024;i++}return n.toFixed(1)+' '+u[i];}
+
+// ── theme ────────────────────────────────────────────────────────────────
+function applyTheme(theme){
+  document.documentElement.setAttribute('data-theme',theme);
+  localStorage.setItem('theme',theme);
+  $('#theme-toggle').textContent=theme==='dark'?'☀️':'🌙';
+}
+let THEME=localStorage.getItem('theme')||(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');
+applyTheme(THEME);
+$('#theme-toggle').addEventListener('click',()=>{THEME=THEME==='dark'?'light':'dark';applyTheme(THEME);});
+
+// ── language ─────────────────────────────────────────────────────────────
+const STRINGS={
+ en:{eyebrow:'PRIVATE CAPTURE',title:'Video Capture',
+  banner:'For content you own or are licensed to download — your own uploads, client or product footage, and public-domain / Creative-Commons material. Watermark removal is for your own content only (e.g. cross-posting your own video to another platform).',
+  urls_ph:'Paste one or more links, one per line…',quality:'Quality',fmt_1080:'Up to 1080p',fmt_720:'Up to 720p',fmt_best:'Best',fmt_audio:'Audio (mp3)',
+  reframe:'Reframe',conv_none:'Keep original',conv_9x16:'9:16 (Reels/TikTok)',conv_1x1:'1:1 (Square)',conv_16x9:'16:9 (YouTube)',
+  cmode_blur:'Blurred pad',cmode_crop:'Center crop',captions_label:'Captions',watermark_label:'Remove watermark (own content only)',
+  wmpos_bl:'Bottom-left',wmpos_br:'Bottom-right',wmpos_tl:'Top-left',wmpos_tr:'Top-right',
+  btn_download:'Download',note_text:"Server downloads, embeds metadata, and (optionally) reframes each file. A Save button appears when it's ready.",
+  lib_ph:'Search your library (title, uploader, tag)',btn_search:'Search',lib_empty:'No saved items yet.',
+  save_file:'Save file',photo:'Photo',captions_prefix:'Captions:',photos_prefix:'Photos:',views:'views',
+  copy_desc:'Copy description',copied:'Copied ✓',remove:'Remove',fetching:'Fetching…',done_label:'Done',
+  preview_loading:'Loading preview…',preview_failed:'No preview available',lang_name:'اردو'},
+ ur:{eyebrow:'ذاتی کیپچر',title:'ویڈیو کیپچر',
+  banner:'صرف اپنے یا لائسنس یافتہ مواد کے لیے — آپ کی اپنی اپلوڈز، کلائنٹ یا پروڈکٹ فوٹیج، اور پبلک ڈومین / کریئیٹو کامنز مواد۔ واٹر مارک ہٹانا صرف آپ کے اپنے مواد کے لیے ہے۔',
+  urls_ph:'ایک یا زیادہ لنکس پیسٹ کریں، ہر لائن میں ایک…',quality:'کوالٹی',fmt_1080:'1080p تک',fmt_720:'720p تک',fmt_best:'بہترین',fmt_audio:'صرف آڈیو (mp3)',
+  reframe:'ری فریم',conv_none:'اصل رکھیں',conv_9x16:'9:16 (ریلز/ٹک ٹاک)',conv_1x1:'1:1 (مربع)',conv_16x9:'16:9 (یوٹیوب)',
+  cmode_blur:'دھندلا پیڈ',cmode_crop:'مرکزی کراپ',captions_label:'کیپشنز',watermark_label:'واٹر مارک ہٹائیں (صرف اپنا مواد)',
+  wmpos_bl:'نیچے بائیں',wmpos_br:'نیچے دائیں',wmpos_tl:'اوپر بائیں',wmpos_tr:'اوپر دائیں',
+  btn_download:'ڈاؤن لوڈ',note_text:'سرور ڈاؤن لوڈ کرتا ہے، میٹا ڈیٹا شامل کرتا ہے، اور (اختیاری طور پر) ہر فائل کو ری فریم کرتا ہے۔ تیار ہونے پر سیو بٹن ظاہر ہوگا۔',
+  lib_ph:'اپنی لائبریری تلاش کریں (عنوان، اپ لوڈر، ٹیگ)',btn_search:'تلاش کریں',lib_empty:'ابھی تک کوئی محفوظ آئٹم نہیں۔',
+  save_file:'فائل محفوظ کریں',photo:'تصویر',captions_prefix:'کیپشنز:',photos_prefix:'تصاویر:',views:'ملاحظات',
+  copy_desc:'تفصیل کاپی کریں',copied:'کاپی ہو گیا ✓',remove:'ہٹائیں',fetching:'حاصل ہو رہا ہے…',done_label:'مکمل',
+  preview_loading:'پیش منظر لوڈ ہو رہا ہے…',preview_failed:'پیش منظر دستیاب نہیں',lang_name:'English'}
+};
+let LANG=localStorage.getItem('lang')||'en';
+function t(key){return (STRINGS[LANG]&&STRINGS[LANG][key])||STRINGS.en[key]||key;}
+function applyLanguage(){
+  document.documentElement.setAttribute('lang',LANG==='ur'?'ur':'en');
+  document.documentElement.setAttribute('dir',LANG==='ur'?'rtl':'ltr');
+  document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.getAttribute('data-i18n'));});
+  document.querySelectorAll('[data-i18n-ph]').forEach(el=>{el.placeholder=t(el.getAttribute('data-i18n-ph'));});
+  $('#lang-toggle').textContent=t('lang_name');
+  render(lastJobs);
+  renderPreviews();
+}
+$('#lang-toggle').addEventListener('click',()=>{LANG=LANG==='en'?'ur':'en';localStorage.setItem('lang',LANG);applyLanguage();});
+
+// ── preview / paste-and-go ───────────────────────────────────────────────
+let previewCache={};
+let previewTimer=null;
+function detectUrls(text){return [...new Set(text.split(/\\s+/).map(s=>s.trim()).filter(u=>/^https?:\\/\\//.test(u)))];}
+function removeUrlFromTextarea(url){
+  $('#urls').value=$('#urls').value.split(/\\n/).filter(line=>line.trim()!==url).join('\\n');
+  delete previewCache[url];
+  renderPreviews();
+}
+function renderPreviews(){
+  const urls=detectUrls($('#urls').value);
+  const container=$('#previews');
+  if(!urls.length){container.innerHTML='';return;}
+  container.innerHTML=urls.map(u=>{
+    const p=previewCache[u];
+    let inner;
+    if(!p||p==='loading'){
+      inner=`<div class="pinfo"><div class="ptitle">${esc(u)}</div><div class="pmeta">${t('preview_loading')}</div></div>`;
+    }else if(p==='error'){
+      inner=`<div class="pinfo"><div class="ptitle">${esc(u)}</div><div class="pmeta">${t('preview_failed')}</div></div>`;
+    }else{
+      const dur=p.duration?Math.floor(p.duration/60)+':'+String(Math.floor(p.duration%60)).padStart(2,'0'):'';
+      const meta=[p.uploader,dur].filter(Boolean).join(' · ');
+      const thumb=p.thumbnail?`<img src="${esc(p.thumbnail)}" loading="lazy">`:'';
+      inner=`${thumb}<div class="pinfo"><div class="ptitle">${esc(p.title||u)}</div><div class="pmeta">${esc(meta)}</div></div>`;
+    }
+    return `<div class="preview">${inner}<span class="premove" data-url="${esc(u)}">✕</span></div>`;
+  }).join('');
+  container.querySelectorAll('.premove').forEach(el=>{
+    el.addEventListener('click',()=>removeUrlFromTextarea(el.getAttribute('data-url')));
+  });
+}
+async function fetchPreview(url){
+  previewCache[url]='loading';
+  renderPreviews();
+  try{
+    const r=await fetch('/api/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
+    previewCache[url]=r.ok?await r.json():'error';
+  }catch(e){previewCache[url]='error';}
+  renderPreviews();
+}
+function onUrlsChanged(){
+  clearTimeout(previewTimer);
+  previewTimer=setTimeout(()=>{
+    const urls=detectUrls($('#urls').value);
+    Object.keys(previewCache).forEach(u=>{if(!urls.includes(u))delete previewCache[u];});
+    renderPreviews();
+    urls.forEach(u=>{if(!(u in previewCache))fetchPreview(u);});
+  },500);
+}
+$('#urls').addEventListener('input',onUrlsChanged);
+$('#urls').addEventListener('paste',()=>setTimeout(onUrlsChanged,30));
+
+// ── jobs ─────────────────────────────────────────────────────────────────
+let lastJobs=[];
 async function submit(){
   const urls=$('#urls').value.split(/\\s+/).map(s=>s.trim()).filter(Boolean);
   if(!urls.length) return;
@@ -762,45 +931,48 @@ async function submit(){
       return;
     }
     $('#urls').value='';
+    previewCache={};
+    renderPreviews();
   }finally{$('#go').disabled=false;}
   poll();
 }
 function metaLine(m){if(!m)return'';const p=[];if(m.uploader)p.push(esc(m.uploader));
-  if(m.view_count)p.push(m.view_count.toLocaleString()+' views');
+  if(m.view_count)p.push(m.view_count.toLocaleString()+' '+t('views'));
   if(m.upload_date)p.push(m.upload_date);return p.join(' · ');}
 function render(list){
   $('#jobs').innerHTML=list.map(j=>{
     const cls=j.status==='done'?'done':j.status==='error'?'error':'';
     const pct=Math.round(j.progress||0);
+    const title=j.filename?esc(j.filename):(j.status==='done'?(j.photos&&j.photos.length?j.photos.length+' '+t('photo')+'(s)':t('done_label')):t('fetching'));
     return `<div class="job">
-      <div class="t">${j.filename?esc(j.filename):(j.status==='done'?(j.photos&&j.photos.length?j.photos.length+' photo(s)':'Done'):'Fetching…')}</div>
+      <div class="t">${title}</div>
       <div class="u">${esc(j.url||'')}</div>
       ${metaLine(j.meta)?`<div class="meta">${metaLine(j.meta)}</div>`:''}
       <div class="bar ${cls}"><i style="width:${pct}%"></i></div>
       <div class="controls" style="justify-content:space-between;margin-top:2px">
         <span class="st ${j.status}">${j.status}${(j.status==='downloading'||j.status==='queued')?' · '+pct+'%':''}${j.size?' · '+fmtSize(j.size):''}</span>
-        <button class="btn ghost" style="padding:5px 10px;font-size:12px;margin-left:0" onclick="del('${j.id}')">Remove</button>
+        <button class="btn ghost" style="padding:5px 10px;font-size:12px;margin-left:0" onclick="del('${j.id}')">${t('remove')}</button>
       </div>
       ${j.error?`<div class="err">${esc(j.error)}</div>`:''}
       ${j.status==='done'?doneExtra(j):''}
     </div>`;}).join('');
 }
 function subLabel(s){const p=s.split('.');return p.length>=2?p[p.length-2]:'srt';}
-function copyDesc(el){navigator.clipboard.writeText(el.getAttribute('data-desc')||'');const t=el.textContent;el.textContent='Copied ✓';setTimeout(()=>el.textContent=t,1200);}
+function copyDesc(el){navigator.clipboard.writeText(el.getAttribute('data-desc')||'');const prevText=el.textContent;el.textContent=t('copied');setTimeout(()=>el.textContent=prevText,1200);}
 function doneExtra(j){
   const m=j.meta||{};
-  const save=j.filename?`<div><a class="dl" href="/api/jobs/${j.id}/file">Save file</a></div>`:'';
-  const photos=(j.photos&&j.photos.length)?`<div class="subrow">Photos: ${j.photos.map((p,i)=>`<a class="subdl" href="/api/jobs/${j.id}/photo/${i}">Photo ${i+1}</a>`).join('')}</div>`:'';
+  const save=j.filename?`<div><a class="dl" href="/api/jobs/${j.id}/file">${t('save_file')}</a></div>`:'';
+  const photos=(j.photos&&j.photos.length)?`<div class="subrow">${t('photos_prefix')} ${j.photos.map((p,i)=>`<a class="subdl" href="/api/jobs/${j.id}/photo/${i}">${t('photo')} ${i+1}</a>`).join('')}</div>`:'';
   const tags=(m.hashtags&&m.hashtags.length)?`<div class="tags">${m.hashtags.map(h=>'#'+esc(h)).join(' ')}</div>`:'';
-  const subs=(j.subs&&j.subs.length)?`<div class="subrow">Captions: ${j.subs.map((s,i)=>`<a class="subdl" href="/api/jobs/${j.id}/sub/${i}">${esc(subLabel(s))}</a>`).join('')}</div>`:'';
-  const desc=m.description?`<div style="margin-top:7px"><span class="subdl" data-desc="${esc(m.description)}" onclick="copyDesc(this)">Copy description</span></div>`:'';
+  const subs=(j.subs&&j.subs.length)?`<div class="subrow">${t('captions_prefix')} ${j.subs.map((s,i)=>`<a class="subdl" href="/api/jobs/${j.id}/sub/${i}">${esc(subLabel(s))}</a>`).join('')}</div>`:'';
+  const desc=m.description?`<div style="margin-top:7px"><span class="subdl" data-desc="${esc(m.description)}" onclick="copyDesc(this)">${t('copy_desc')}</span></div>`:'';
   return save+photos+tags+subs+desc;
 }
 async function del(id){await fetch('/api/jobs/'+id+'/delete',{method:'POST'});poll();}
 async function poll(){
   try{const r=await fetch('/api/jobs');
-    const d=await r.json();render(d.jobs||[]);
-    if((d.jobs||[]).some(j=>['downloading','queued','converting','retrying','watermarking','packaging'].includes(j.status))) setTimeout(poll,1500);
+    const d=await r.json();lastJobs=d.jobs||[];render(lastJobs);
+    if(lastJobs.some(j=>['downloading','queued','converting','retrying','watermarking','packaging'].includes(j.status))) setTimeout(poll,1500);
   }catch(e){setTimeout(poll,3000);}
 }
 async function search(){
@@ -809,10 +981,11 @@ async function search(){
   $('#lib').innerHTML=(d.items||[]).map(it=>`<div class="libitem">
     <div>${esc(it.title||it.filename||'—')}</div>
     <div class="m">${[esc(it.uploader||''),it.upload_date||'',fmtSize(it.size)].filter(Boolean).join(' · ')}</div>
-  </div>`).join('')||'<span>No saved items yet.</span>';
+  </div>`).join('')||`<span>${t('lib_empty')}</span>`;
 }
 $('#go').addEventListener('click',submit);
 $('#search').addEventListener('click',search);
+applyLanguage();
 poll();
 </script>
 </body></html>"""
