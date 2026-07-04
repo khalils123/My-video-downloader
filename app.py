@@ -7,8 +7,8 @@ Adds on top of v1:
                     can search your own library later.
   • Aspect ratio  — optional ffmpeg pass to 9:16 / 1:1 / 16:9, center-crop or blurred-pad.
   • Batch audio   — paste many links, pick "Audio only (mp3)".
-  • Photo posts   — TikTok/Instagram "photo mode" slideshows are bundled
-                    (images + any background audio) into one downloadable zip.
+  • Photo posts   — TikTok/Instagram "photo mode" slideshows: each image (and
+                    any background audio) gets its own download link.
   • Library search — /api/library?q=... over saved metadata.
   • Watermark removal — opt-in, corner-preset ffmpeg delogo pass. For YOUR OWN content
                     only (e.g. cross-posting your own video to another platform without
@@ -19,8 +19,13 @@ so job state survives a web-process restart/redeploy and concurrency is
 controlled by how many `worker.py` processes you run (not MAX_CONCURRENT,
 which no longer exists — run more worker instances for more concurrency).
 
+Nothing lingers on disk: a job's files are deleted the moment every file it
+produced (main file + all photos + all captions) has been downloaded at
+least once. FILE_TTL_MIN is just the safety net for files that are never
+downloaded at all.
+
 Env vars (see README): DOWNLOAD_DIR,
-FILE_TTL_MIN (default 60), MAX_URLS_PER_REQUEST (default 10),
+FILE_TTL_MIN (default 30), MAX_URLS_PER_REQUEST (default 10),
 DOWNLOAD_TIMEOUT_SEC (default 1800), CONVERT_TIMEOUT_SEC (default 600),
 RATE_LIMIT_MAX / RATE_LIMIT_WINDOW_SEC (default 5 per 60s per IP),
 MIN_FREE_DISK_MB (default 1024), ALLOWED_DOMAINS (comma-separated
@@ -38,7 +43,7 @@ import redis as redis_lib
 from rq import Queue
 
 DOWNLOAD_DIR        = os.environ.get("DOWNLOAD_DIR", "/var/lib/vidcapture")
-FILE_TTL_MIN        = int(os.environ.get("FILE_TTL_MIN", "60"))
+FILE_TTL_MIN        = int(os.environ.get("FILE_TTL_MIN", "30"))
 def _find_binary(name):
     """shutil.which() alone can miss binaries installed only in the venv if
     the caller's PATH doesn't include venv/bin (e.g. a systemd unit that
@@ -218,10 +223,10 @@ def is_safe_url(url):
     return True
 
 # ── job store (Redis-backed; survives web-process restarts) ─────────────────
-_JOB_JSON_FIELDS = {"meta", "subs", "photos"}
+_JOB_JSON_FIELDS = {"meta", "subs", "photos", "served_photos", "served_subs"}
 _JOB_FLOAT_FIELDS = {"progress", "created"}
 _JOB_INT_FIELDS = {"size"}
-_JOB_BOOL_FIELDS = {"captions", "watermark"}
+_JOB_BOOL_FIELDS = {"captions", "watermark", "served_file"}
 
 def _encode_field(key, value):
     if value is None:
@@ -299,6 +304,37 @@ def list_job_ids(limit=10000):
 def delete_job_record(jid):
     redis_conn.delete(JOB_KEY_PREFIX + jid)
     redis_conn.zrem(JOB_INDEX_KEY, jid)
+    shutil.rmtree(os.path.join(DOWNLOAD_DIR, jid), ignore_errors=True)
+
+def all_files_served(j):
+    """True once every file the job produced (main file + all photos + all
+    captions) has been downloaded at least once. Jobs with nothing produced
+    yet (still queued/erroring) are never considered fully served."""
+    expected = (1 if j.get("file") else 0) + len(j.get("photos") or []) + len(j.get("subs") or [])
+    if expected == 0:
+        return False
+    file_ok = (not j.get("file")) or bool(j.get("served_file"))
+    photos_ok = len(set(j.get("served_photos") or [])) >= len(j.get("photos") or [])
+    subs_ok = len(set(j.get("served_subs") or [])) >= len(j.get("subs") or [])
+    return file_ok and photos_ok and subs_ok
+
+def mark_served_and_maybe_cleanup(jid, kind, idx=None):
+    key = JOB_KEY_PREFIX + jid
+    if kind == "file":
+        redis_conn.hset(key, "served_file", "1")
+    elif kind == "photo":
+        served = json.loads(redis_conn.hget(key, "served_photos") or "[]")
+        if idx not in served:
+            served.append(idx)
+        redis_conn.hset(key, "served_photos", json.dumps(served))
+    elif kind == "sub":
+        served = json.loads(redis_conn.hget(key, "served_subs") or "[]")
+        if idx not in served:
+            served.append(idx)
+        redis_conn.hset(key, "served_subs", json.dumps(served))
+    j = get_job_dict(jid)
+    if j and all_files_served(j):
+        delete_job_record(jid)
 
 def load_meta(outdir):
     for f in os.listdir(outdir):
@@ -522,7 +558,6 @@ def cleanup_loop():
             created = j.get("created") if j else None
             if created is None or now - created > FILE_TTL_MIN * 60:
                 delete_job_record(jid)
-                shutil.rmtree(os.path.join(DOWNLOAD_DIR, jid), ignore_errors=True)
         # sweep orphaned job directories with no matching Redis record
         # (e.g. left behind by a Redis flush or an old in-memory-jobs deploy)
         try:
@@ -609,6 +644,7 @@ def submit():
                    watermark=watermark, watermark_pos=watermark_pos,
                    status="queued", progress=0.0, file=None,
                    filename=None, error=None, meta={}, subs=[], photos=[],
+                   served_file=False, served_photos=[], served_subs=[],
                    created=time.time())
         job_queue.enqueue(run_job, jid, job_timeout=RQ_JOB_TIMEOUT_SEC)
         created.append(jid)
@@ -627,7 +663,6 @@ def list_jobs():
 @app.post("/api/jobs/<jid>/delete")
 def delete_job(jid):
     delete_job_record(jid)
-    shutil.rmtree(os.path.join(DOWNLOAD_DIR, jid), ignore_errors=True)
     return jsonify({"ok": True})
 
 @app.get("/api/jobs/<jid>/file")
@@ -638,7 +673,9 @@ def download(jid):
     path = os.path.realpath(j["file"])
     if not path.startswith(os.path.realpath(DOWNLOAD_DIR)) or not os.path.exists(path):
         abort(404)
-    return send_file(path, as_attachment=True, download_name=j["filename"])
+    resp = send_file(path, as_attachment=True, download_name=j["filename"])
+    resp.call_on_close(lambda: mark_served_and_maybe_cleanup(jid, "file"))
+    return resp
 
 @app.get("/api/jobs/<jid>/sub/<int:idx>")
 def sub(jid, idx):
@@ -651,7 +688,9 @@ def sub(jid, idx):
     path = os.path.realpath(os.path.join(DOWNLOAD_DIR, jid, subs[idx]))
     if not path.startswith(os.path.realpath(DOWNLOAD_DIR)) or not os.path.exists(path):
         abort(404)
-    return send_file(path, as_attachment=True, download_name=subs[idx])
+    resp = send_file(path, as_attachment=True, download_name=subs[idx])
+    resp.call_on_close(lambda: mark_served_and_maybe_cleanup(jid, "sub", idx))
+    return resp
 
 @app.get("/api/jobs/<jid>/photo/<int:idx>")
 def photo(jid, idx):
@@ -664,7 +703,9 @@ def photo(jid, idx):
     path = os.path.realpath(os.path.join(DOWNLOAD_DIR, jid, photos[idx]))
     if not path.startswith(os.path.realpath(DOWNLOAD_DIR)) or not os.path.exists(path):
         abort(404)
-    return send_file(path, as_attachment=True, download_name=photos[idx])
+    resp = send_file(path, as_attachment=True, download_name=photos[idx])
+    resp.call_on_close(lambda: mark_served_and_maybe_cleanup(jid, "photo", idx))
+    return resp
 
 @app.get("/api/library")
 def library():
