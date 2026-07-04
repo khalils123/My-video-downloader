@@ -77,6 +77,7 @@ GALLERYDL_TIMEOUT_SEC = int(os.environ.get("GALLERYDL_TIMEOUT_SEC", "300"))
 WHISPER             = _find_binary("whisper")  # optional: openai-whisper CLI, for auto-caption burn-in
 WHISPER_MODEL       = os.environ.get("WHISPER_MODEL", "base")
 BURN_CAPTIONS_TIMEOUT_SEC = int(os.environ.get("BURN_CAPTIONS_TIMEOUT_SEC", "900"))
+STRIP_METADATA_TIMEOUT_SEC = int(os.environ.get("STRIP_METADATA_TIMEOUT_SEC", "120"))
 WATERMARK_TIMEOUT_SEC = int(os.environ.get("WATERMARK_TIMEOUT_SEC", "300"))
 MAX_URLS_PER_REQUEST = int(os.environ.get("MAX_URLS_PER_REQUEST", "10"))
 DOWNLOAD_TIMEOUT_SEC = int(os.environ.get("DOWNLOAD_TIMEOUT_SEC", "1800"))
@@ -264,7 +265,7 @@ _JOB_JSON_FIELDS = {"meta", "subs", "photos", "served_photos", "served_subs", "d
 _JOB_JSON_DICT_FIELDS = {"meta", "duplicate"}  # these default to {} empty; others default to []
 _JOB_FLOAT_FIELDS = {"progress", "created"}
 _JOB_INT_FIELDS = {"size"}
-_JOB_BOOL_FIELDS = {"captions", "watermark", "served_file", "burn_captions"}
+_JOB_BOOL_FIELDS = {"captions", "watermark", "served_file", "burn_captions", "strip_metadata"}
 
 def _encode_field(key, value):
     if value is None:
@@ -515,6 +516,17 @@ def burn_subtitles(src, dst, srt_path):
     except subprocess.TimeoutExpired:
         return False
 
+def strip_metadata(src, dst):
+    """Stream-copy pass that drops container metadata (GPS, device model,
+    source-app tags, etc.) — a privacy cleanup, not a fingerprint/content-ID
+    workaround: it doesn't touch the actual audio/video data."""
+    cmd = [FFMPEG, "-y", "-i", src, "-map_metadata", "-1", "-c", "copy", dst]
+    try:
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=STRIP_METADATA_TIMEOUT_SEC).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
 def _run_ytdlp_once(cmd, job):
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -635,6 +647,14 @@ def run_job(job_id):
                     dst = os.path.join(outdir, "%s.cc.mp4" % base)
                     if burn_subtitles(primary, dst, srt_path) and os.path.exists(dst):
                         primary = dst
+
+            # optional metadata strip (privacy cleanup; video or audio, final step)
+            if job.get("strip_metadata"):
+                job["status"] = "cleaning"
+                base, ext = os.path.splitext(primary)
+                dst = base + ".clean" + ext
+                if strip_metadata(primary, dst) and os.path.exists(dst):
+                    primary = dst
 
         job["file"] = primary
         job["filename"] = os.path.basename(primary) if primary else None
@@ -782,6 +802,7 @@ def submit():
     watermark_pos = data.get("watermark_pos", "bl")
     watermark_pos = watermark_pos if watermark_pos in WATERMARK_PRESETS else "bl"
     burn_captions = bool(data.get("burn_captions"))
+    strip_meta = bool(data.get("strip_metadata"))
     created = []
     for u in urls:
         u = (u or "").strip()
@@ -793,7 +814,7 @@ def submit():
         create_job(jid, id=jid, url=u, format=fmt, convert=convert,
                    convert_mode=convert_mode, captions=captions,
                    watermark=watermark, watermark_pos=watermark_pos,
-                   burn_captions=burn_captions,
+                   burn_captions=burn_captions, strip_metadata=strip_meta,
                    status="queued", progress=0.0, file=None,
                    filename=None, error=None, meta={}, subs=[], photos=[],
                    served_file=False, served_photos=[], served_subs=[], duplicate={},
@@ -1007,7 +1028,7 @@ textarea:focus,input:focus,select:focus{outline:none;border-color:var(--accent);
 .bar.done>i{background:var(--done);width:100%}
 .bar.error>i{background:var(--error);width:100%}
 .st{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}
-.st.done{color:var(--done)}.st.error{color:var(--error)}.st.downloading,.st.converting,.st.retrying,.st.watermarking,.st.packaging,.st.captioning{color:var(--accent)}
+.st.done{color:var(--done)}.st.error{color:var(--error)}.st.downloading,.st.converting,.st.retrying,.st.watermarking,.st.packaging,.st.captioning,.st.cleaning{color:var(--accent)}
 .err{color:var(--error);font-size:12px;margin-top:4px}
 a.dl{display:inline-block;margin-top:8px;background:var(--done);color:var(--done-fg);font-weight:700;
  font-size:13px;padding:8px 14px;border-radius:9px;text-decoration:none}
@@ -1076,6 +1097,7 @@ APP_HTML = """<!doctype html><html><head><meta charset="utf-8">
     <option value="tr" data-i18n="wmpos_tr">Top-right</option>
    </select>
    <label style="display:flex;align-items:center;gap:6px;margin-left:2px"><input type="checkbox" id="burncc" style="width:auto;accent-color:#F6A73B"> <span data-i18n="burn_captions_label">Auto-burn captions (Whisper)</span></label>
+   <label style="display:flex;align-items:center;gap:6px;margin-left:2px"><input type="checkbox" id="stripmeta" style="width:auto;accent-color:#F6A73B"> <span data-i18n="strip_metadata_label">Strip metadata (privacy)</span></label>
    <button class="btn" id="go" data-i18n="btn_download">Download</button>
   </div>
   <p class="note" data-i18n="note_text">Server downloads, embeds metadata, and (optionally) reframes each file. A Save button appears when it's ready.</p>
@@ -1131,7 +1153,8 @@ const STRINGS={
   select_export:'Select',selected:'selected',clear_selection:'Clear',export_zip:'Export as ZIP',
   duplicate_note:"You've downloaded this before as",
   sort_newest:'Newest',sort_views:'Most viewed',sort_likes:'Most liked',export_csv:'Export CSV',
-  hashtags_heading:'Trending in your library:',burn_captions_label:'Auto-burn captions (Whisper)'},
+  hashtags_heading:'Trending in your library:',burn_captions_label:'Auto-burn captions (Whisper)',
+  strip_metadata_label:'Strip metadata (privacy)'},
  ur:{eyebrow:'ذاتی کیپچر',title:'ویڈیو کیپچر',
   banner:'صرف اپنے یا لائسنس یافتہ مواد کے لیے — آپ کی اپنی اپلوڈز، کلائنٹ یا پروڈکٹ فوٹیج، اور پبلک ڈومین / کریئیٹو کامنز مواد۔ واٹر مارک ہٹانا صرف آپ کے اپنے مواد کے لیے ہے۔',
   urls_ph:'ایک یا زیادہ لنکس پیسٹ کریں، ہر لائن میں ایک…',quality:'کوالٹی',fmt_1080:'1080p تک',fmt_720:'720p تک',fmt_best:'بہترین',fmt_audio:'صرف آڈیو (mp3)',
@@ -1146,7 +1169,8 @@ const STRINGS={
   select_export:'منتخب کریں',selected:'منتخب',clear_selection:'صاف کریں',export_zip:'ZIP کے طور پر برآمد کریں',
   duplicate_note:'آپ یہ پہلے ڈاؤن لوڈ کر چکے ہیں بطور',
   sort_newest:'تازہ ترین',sort_views:'زیادہ دیکھی گئی',sort_likes:'زیادہ پسند کی گئی',export_csv:'CSV برآمد کریں',
-  hashtags_heading:'آپ کی لائبریری میں رجحان ساز:',burn_captions_label:'خودکار کیپشنز جلائیں (Whisper)'}
+  hashtags_heading:'آپ کی لائبریری میں رجحان ساز:',burn_captions_label:'خودکار کیپشنز جلائیں (Whisper)',
+  strip_metadata_label:'میٹا ڈیٹا ہٹائیں (پرائیویسی)'}
 };
 let LANG=localStorage.getItem('lang')||'en';
 function t(key){return (STRINGS[LANG]&&STRINGS[LANG][key])||STRINGS.en[key]||key;}
@@ -1225,7 +1249,7 @@ async function submit(){
   $('#submitErr').textContent='';
   try{
     const r=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({urls,format:$('#fmt').value,convert:$('#conv').value,convert_mode:$('#cmode').value,captions:$('#caps').checked,watermark:$('#wm').checked,watermark_pos:$('#wmpos').value,burn_captions:$('#burncc').checked})});
+      body:JSON.stringify({urls,format:$('#fmt').value,convert:$('#conv').value,convert_mode:$('#cmode').value,captions:$('#caps').checked,watermark:$('#wm').checked,watermark_pos:$('#wmpos').value,burn_captions:$('#burncc').checked,strip_metadata:$('#stripmeta').checked})});
     if(!r.ok){
       const d=await r.json().catch(()=>({}));
       $('#submitErr').textContent=d.error||'Something went wrong. Please try again.';
@@ -1321,7 +1345,7 @@ async function del(id){await fetch('/api/jobs/'+id+'/delete',{method:'POST'});po
 async function poll(){
   try{const r=await fetch('/api/jobs');
     const d=await r.json();lastJobs=d.jobs||[];render(lastJobs);
-    if(lastJobs.some(j=>['downloading','queued','converting','retrying','watermarking','packaging','captioning'].includes(j.status))) setTimeout(poll,1500);
+    if(lastJobs.some(j=>['downloading','queued','converting','retrying','watermarking','packaging','captioning','cleaning'].includes(j.status))) setTimeout(poll,1500);
   }catch(e){setTimeout(poll,3000);}
 }
 async function search(){
