@@ -9,10 +9,20 @@ Adds on top of v1:
   • Batch audio   — paste many links, pick "Audio only (mp3)".
   • Photo posts   — TikTok/Instagram "photo mode" slideshows: each image (and
                     any background audio) gets its own download link.
-  • Library search — /api/library?q=... over saved metadata.
+  • Library search — /api/library?q=... over saved metadata, sortable by views/likes;
+                    /api/library/export for a manifest CSV, /api/library/hashtags for
+                    a "trending in your own library" hashtag ranking.
   • Watermark removal — opt-in, corner-preset ffmpeg delogo pass. For YOUR OWN content
                     only (e.g. cross-posting your own video to another platform without
                     double branding) — not for stripping other creators' marks.
+  • Bulk ZIP export — /api/export bundles several completed downloads into one zip
+                    + manifest.csv (title/uploader/hashtags/date/views/likes).
+  • Duplicate detection — every download is sha256-hashed against library.db; jobs
+                    surface a note when the same content was downloaded before.
+  • Caption burn-in — opt-in, auto-transcribes via the (optional) openai-whisper CLI
+                    and burns the captions into the final video. Not installed by
+                    default (needs torch — a heavy dependency); install manually with
+                    `pip install openai-whisper` in the venv if you want this feature.
 
 Jobs are queued via Redis/RQ (see worker.py) instead of in-process threads,
 so job state survives a web-process restart/redeploy and concurrency is
@@ -32,9 +42,13 @@ MIN_FREE_DISK_MB (default 1024), ALLOWED_DOMAINS (comma-separated
 hostnames; empty = allow all), MAX_FILE_SIZE_MB (default 2048),
 YTDLP_MAX_RETRIES / YTDLP_RETRY_BACKOFF_SEC (default 2 retries, 5s backoff),
 REDIS_HOST / REDIS_PORT / REDIS_DB (default localhost:6379/0),
-RQ_QUEUE_NAME (default video-downloader), RQ_JOB_TIMEOUT_SEC.
-Needs on the server: python3, ffmpeg, yt-dlp, redis-server, and (optional,
-for photo/gallery posts yt-dlp can't parse) gallery-dl.
+RQ_QUEUE_NAME (default video-downloader), RQ_JOB_TIMEOUT_SEC,
+PREVIEW_TIMEOUT_SEC (default 20), MAX_EXPORT_JOBS (default 20),
+GALLERYDL_TIMEOUT_SEC (default 300), WHISPER_MODEL (default "base"),
+BURN_CAPTIONS_TIMEOUT_SEC (default 900).
+Needs on the server: python3, ffmpeg, yt-dlp, redis-server, and (optional)
+gallery-dl (photo/gallery posts yt-dlp can't parse) and openai-whisper
+(caption burn-in — not installed by default, pulls in torch).
 """
 import os, re, json, time, uuid, shutil, socket, ipaddress, sqlite3, threading, subprocess, hashlib, zipfile, csv, io
 from flask import (Flask, request, jsonify,
@@ -60,6 +74,9 @@ FFMPEG              = _find_binary("ffmpeg") or "ffmpeg"
 FFPROBE             = _find_binary("ffprobe") or "ffprobe"
 GALLERYDL           = _find_binary("gallery-dl")  # optional: fallback for photo/gallery posts yt-dlp can't parse
 GALLERYDL_TIMEOUT_SEC = int(os.environ.get("GALLERYDL_TIMEOUT_SEC", "300"))
+WHISPER             = _find_binary("whisper")  # optional: openai-whisper CLI, for auto-caption burn-in
+WHISPER_MODEL       = os.environ.get("WHISPER_MODEL", "base")
+BURN_CAPTIONS_TIMEOUT_SEC = int(os.environ.get("BURN_CAPTIONS_TIMEOUT_SEC", "900"))
 WATERMARK_TIMEOUT_SEC = int(os.environ.get("WATERMARK_TIMEOUT_SEC", "300"))
 MAX_URLS_PER_REQUEST = int(os.environ.get("MAX_URLS_PER_REQUEST", "10"))
 DOWNLOAD_TIMEOUT_SEC = int(os.environ.get("DOWNLOAD_TIMEOUT_SEC", "1800"))
@@ -247,7 +264,7 @@ _JOB_JSON_FIELDS = {"meta", "subs", "photos", "served_photos", "served_subs", "d
 _JOB_JSON_DICT_FIELDS = {"meta", "duplicate"}  # these default to {} empty; others default to []
 _JOB_FLOAT_FIELDS = {"progress", "created"}
 _JOB_INT_FIELDS = {"size"}
-_JOB_BOOL_FIELDS = {"captions", "watermark", "served_file"}
+_JOB_BOOL_FIELDS = {"captions", "watermark", "served_file", "burn_captions"}
 
 def _encode_field(key, value):
     if value is None:
@@ -470,6 +487,34 @@ def remove_watermark(src, dst, region):
     except subprocess.TimeoutExpired:
         return False
 
+def generate_whisper_srt(video_path, outdir):
+    """Auto-transcribe via the (optional) openai-whisper CLI. Returns the
+    generated .srt path, or None if whisper isn't installed or fails/times out."""
+    if not WHISPER:
+        return None
+    cmd = [WHISPER, video_path, "--model", WHISPER_MODEL, "--output_format", "srt",
+           "--output_dir", outdir, "--task", "transcribe"]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=BURN_CAPTIONS_TIMEOUT_SEC)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    srt_path = os.path.join(outdir, os.path.splitext(os.path.basename(video_path))[0] + ".srt")
+    return srt_path if os.path.exists(srt_path) else None
+
+def burn_subtitles(src, dst, srt_path):
+    # ffmpeg's subtitles filter treats ':' and '\' specially in its own arg parsing
+    escaped = srt_path.replace("\\", "\\\\").replace(":", "\\:")
+    cmd = [FFMPEG, "-y", "-i", src, "-vf", "subtitles=%s" % escaped, "-c:a", "copy",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "0", dst]
+    try:
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=BURN_CAPTIONS_TIMEOUT_SEC).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
 def _run_ytdlp_once(cmd, job):
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -579,6 +624,17 @@ def run_job(job_id):
                 rc = convert_aspect(primary, dst, ratio, job.get("convert_mode", "blur"))
                 if rc == 0 and os.path.exists(dst):
                     primary = dst
+
+            # optional Whisper auto-caption burn-in (last video step, so
+            # captions match the final reframed dimensions; video only)
+            if job.get("burn_captions") and job["format"] != "audio":
+                job["status"] = "captioning"
+                srt_path = generate_whisper_srt(primary, outdir)
+                if srt_path:
+                    base = os.path.splitext(os.path.basename(primary))[0]
+                    dst = os.path.join(outdir, "%s.cc.mp4" % base)
+                    if burn_subtitles(primary, dst, srt_path) and os.path.exists(dst):
+                        primary = dst
 
         job["file"] = primary
         job["filename"] = os.path.basename(primary) if primary else None
@@ -695,6 +751,7 @@ def submit():
     watermark = bool(data.get("watermark"))
     watermark_pos = data.get("watermark_pos", "bl")
     watermark_pos = watermark_pos if watermark_pos in WATERMARK_PRESETS else "bl"
+    burn_captions = bool(data.get("burn_captions"))
     created = []
     for u in urls:
         u = (u or "").strip()
@@ -706,6 +763,7 @@ def submit():
         create_job(jid, id=jid, url=u, format=fmt, convert=convert,
                    convert_mode=convert_mode, captions=captions,
                    watermark=watermark, watermark_pos=watermark_pos,
+                   burn_captions=burn_captions,
                    status="queued", progress=0.0, file=None,
                    filename=None, error=None, meta={}, subs=[], photos=[],
                    served_file=False, served_photos=[], served_subs=[], duplicate={},
@@ -827,18 +885,51 @@ def export():
             delete_job_record(j["id"])
     return on_response_close(resp, _cleanup)
 
+LIBRARY_SORT_COLUMNS = {"created": "created", "views": "view_count", "likes": "like_count"}
+
 @app.get("/api/library")
 def library():
     q = (request.args.get("q") or "").strip()
+    sort_col = LIBRARY_SORT_COLUMNS.get(request.args.get("sort"), "created")
     with db() as c:
         if q:
             like = "%" + q + "%"
-            rows = c.execute("""SELECT * FROM library
+            rows = c.execute(f"""SELECT * FROM library
                 WHERE title LIKE ? OR uploader LIKE ? OR tags LIKE ?
-                ORDER BY created DESC LIMIT 100""", (like, like, like)).fetchall()
+                ORDER BY {sort_col} DESC LIMIT 100""", (like, like, like)).fetchall()
         else:
-            rows = c.execute("SELECT * FROM library ORDER BY created DESC LIMIT 100").fetchall()
+            rows = c.execute(f"SELECT * FROM library ORDER BY {sort_col} DESC LIMIT 100").fetchall()
     return jsonify({"items": [dict(r) for r in rows]})
+
+@app.get("/api/library/export")
+def library_export():
+    sort_col = LIBRARY_SORT_COLUMNS.get(request.args.get("sort"), "views")
+    with db() as c:
+        rows = c.execute(f"SELECT * FROM library ORDER BY {sort_col} DESC").fetchall()
+    fieldnames = ["title", "uploader", "upload_date", "view_count", "like_count", "tags", "filename", "url", "created"]
+    csv_buf = io.StringIO()
+    writer = csv.DictWriter(csv_buf, fieldnames=fieldnames)
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({k: r[k] for k in fieldnames})
+    data = io.BytesIO(csv_buf.getvalue().encode())
+    return send_file(data, as_attachment=True, download_name="library_export.csv", mimetype="text/csv")
+
+@app.get("/api/library/hashtags")
+def library_hashtags():
+    limit = min(max(int(request.args.get("limit", 20) or 20), 1), 100)
+    with db() as c:
+        rows = c.execute("SELECT tags, view_count FROM library WHERE tags IS NOT NULL AND tags != ''").fetchall()
+    counts, weighted = {}, {}
+    for r in rows:
+        for tag in (t.strip() for t in (r["tags"] or "").split(",")):
+            if not tag:
+                continue
+            key = tag.lower()
+            counts[key] = counts.get(key, 0) + 1
+            weighted[key] = weighted.get(key, 0) + (r["view_count"] or 0)
+    ranked = sorted(counts, key=lambda k: (weighted.get(k, 0), counts[k]), reverse=True)[:limit]
+    return jsonify({"hashtags": [{"tag": k, "count": counts[k], "views": weighted.get(k, 0)} for k in ranked]})
 
 # ── templates ──────────────────────────────────────────────────────────────────
 BASE_CSS = """
@@ -886,7 +977,7 @@ textarea:focus,input:focus,select:focus{outline:none;border-color:var(--accent);
 .bar.done>i{background:var(--done);width:100%}
 .bar.error>i{background:var(--error);width:100%}
 .st{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}
-.st.done{color:var(--done)}.st.error{color:var(--error)}.st.downloading,.st.converting,.st.retrying,.st.watermarking,.st.packaging{color:var(--accent)}
+.st.done{color:var(--done)}.st.error{color:var(--error)}.st.downloading,.st.converting,.st.retrying,.st.watermarking,.st.packaging,.st.captioning{color:var(--accent)}
 .err{color:var(--error);font-size:12px;margin-top:4px}
 a.dl{display:inline-block;margin-top:8px;background:var(--done);color:var(--done-fg);font-weight:700;
  font-size:13px;padding:8px 14px;border-radius:9px;text-decoration:none}
@@ -954,6 +1045,7 @@ APP_HTML = """<!doctype html><html><head><meta charset="utf-8">
     <option value="tl" data-i18n="wmpos_tl">Top-left</option>
     <option value="tr" data-i18n="wmpos_tr">Top-right</option>
    </select>
+   <label style="display:flex;align-items:center;gap:6px;margin-left:2px"><input type="checkbox" id="burncc" style="width:auto;accent-color:#F6A73B"> <span data-i18n="burn_captions_label">Auto-burn captions (Whisper)</span></label>
    <button class="btn" id="go" data-i18n="btn_download">Download</button>
   </div>
   <p class="note" data-i18n="note_text">Server downloads, embeds metadata, and (optionally) reframes each file. A Save button appears when it's ready.</p>
@@ -966,9 +1058,16 @@ APP_HTML = """<!doctype html><html><head><meta charset="utf-8">
  <div class="card">
   <div class="controls" style="margin-top:0">
    <input id="q" data-i18n-ph="lib_ph" placeholder="Search your library (title, uploader, tag)" style="flex:1">
+   <select id="libsort">
+    <option value="created" data-i18n="sort_newest">Newest</option>
+    <option value="views" data-i18n="sort_views">Most viewed</option>
+    <option value="likes" data-i18n="sort_likes">Most liked</option>
+   </select>
    <button class="btn ghost" id="search" data-i18n="btn_search">Search</button>
+   <button class="btn ghost" id="exportLib" data-i18n="export_csv">Export CSV</button>
   </div>
   <div id="lib" class="note"></div>
+  <div id="hashtagSuggest" class="note"></div>
  </div>
 </div>
 <script>
@@ -1000,7 +1099,9 @@ const STRINGS={
   copy_desc:'Copy description',copied:'Copied ✓',remove:'Remove',fetching:'Fetching…',done_label:'Done',
   preview_loading:'Loading preview…',preview_failed:'No preview available',lang_name:'اردو',
   select_export:'Select',selected:'selected',clear_selection:'Clear',export_zip:'Export as ZIP',
-  duplicate_note:"You've downloaded this before as"},
+  duplicate_note:"You've downloaded this before as",
+  sort_newest:'Newest',sort_views:'Most viewed',sort_likes:'Most liked',export_csv:'Export CSV',
+  hashtags_heading:'Trending in your library:',burn_captions_label:'Auto-burn captions (Whisper)'},
  ur:{eyebrow:'ذاتی کیپچر',title:'ویڈیو کیپچر',
   banner:'صرف اپنے یا لائسنس یافتہ مواد کے لیے — آپ کی اپنی اپلوڈز، کلائنٹ یا پروڈکٹ فوٹیج، اور پبلک ڈومین / کریئیٹو کامنز مواد۔ واٹر مارک ہٹانا صرف آپ کے اپنے مواد کے لیے ہے۔',
   urls_ph:'ایک یا زیادہ لنکس پیسٹ کریں، ہر لائن میں ایک…',quality:'کوالٹی',fmt_1080:'1080p تک',fmt_720:'720p تک',fmt_best:'بہترین',fmt_audio:'صرف آڈیو (mp3)',
@@ -1013,7 +1114,9 @@ const STRINGS={
   copy_desc:'تفصیل کاپی کریں',copied:'کاپی ہو گیا ✓',remove:'ہٹائیں',fetching:'حاصل ہو رہا ہے…',done_label:'مکمل',
   preview_loading:'پیش منظر لوڈ ہو رہا ہے…',preview_failed:'پیش منظر دستیاب نہیں',lang_name:'English',
   select_export:'منتخب کریں',selected:'منتخب',clear_selection:'صاف کریں',export_zip:'ZIP کے طور پر برآمد کریں',
-  duplicate_note:'آپ یہ پہلے ڈاؤن لوڈ کر چکے ہیں بطور'}
+  duplicate_note:'آپ یہ پہلے ڈاؤن لوڈ کر چکے ہیں بطور',
+  sort_newest:'تازہ ترین',sort_views:'زیادہ دیکھی گئی',sort_likes:'زیادہ پسند کی گئی',export_csv:'CSV برآمد کریں',
+  hashtags_heading:'آپ کی لائبریری میں رجحان ساز:',burn_captions_label:'خودکار کیپشنز جلائیں (Whisper)'}
 };
 let LANG=localStorage.getItem('lang')||'en';
 function t(key){return (STRINGS[LANG]&&STRINGS[LANG][key])||STRINGS.en[key]||key;}
@@ -1026,6 +1129,7 @@ function applyLanguage(){
   render(lastJobs);
   renderPreviews();
   renderExportBar();
+  loadHashtagSuggestions();
 }
 $('#lang-toggle').addEventListener('click',()=>{LANG=LANG==='en'?'ur':'en';localStorage.setItem('lang',LANG);applyLanguage();});
 
@@ -1091,7 +1195,7 @@ async function submit(){
   $('#submitErr').textContent='';
   try{
     const r=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({urls,format:$('#fmt').value,convert:$('#conv').value,convert_mode:$('#cmode').value,captions:$('#caps').checked,watermark:$('#wm').checked,watermark_pos:$('#wmpos').value})});
+      body:JSON.stringify({urls,format:$('#fmt').value,convert:$('#conv').value,convert_mode:$('#cmode').value,captions:$('#caps').checked,watermark:$('#wm').checked,watermark_pos:$('#wmpos').value,burn_captions:$('#burncc').checked})});
     if(!r.ok){
       const d=await r.json().catch(()=>({}));
       $('#submitErr').textContent=d.error||'Something went wrong. Please try again.';
@@ -1187,20 +1291,37 @@ async function del(id){await fetch('/api/jobs/'+id+'/delete',{method:'POST'});po
 async function poll(){
   try{const r=await fetch('/api/jobs');
     const d=await r.json();lastJobs=d.jobs||[];render(lastJobs);
-    if(lastJobs.some(j=>['downloading','queued','converting','retrying','watermarking','packaging'].includes(j.status))) setTimeout(poll,1500);
+    if(lastJobs.some(j=>['downloading','queued','converting','retrying','watermarking','packaging','captioning'].includes(j.status))) setTimeout(poll,1500);
   }catch(e){setTimeout(poll,3000);}
 }
 async function search(){
-  const r=await fetch('/api/library?q='+encodeURIComponent($('#q').value));
+  const sort=$('#libsort').value;
+  const r=await fetch('/api/library?sort='+encodeURIComponent(sort)+'&q='+encodeURIComponent($('#q').value));
   const d=await r.json();
   $('#lib').innerHTML=(d.items||[]).map(it=>`<div class="libitem">
     <div>${esc(it.title||it.filename||'—')}</div>
-    <div class="m">${[esc(it.uploader||''),it.upload_date||'',fmtSize(it.size)].filter(Boolean).join(' · ')}</div>
+    <div class="m">${[esc(it.uploader||''),it.upload_date||'',it.view_count?it.view_count.toLocaleString()+' '+t('views'):'',fmtSize(it.size)].filter(Boolean).join(' · ')}</div>
   </div>`).join('')||`<span>${t('lib_empty')}</span>`;
+}
+async function loadHashtagSuggestions(){
+  try{
+    const r=await fetch('/api/library/hashtags?limit=15');
+    const d=await r.json();
+    const tags=d.hashtags||[];
+    if(!tags.length){$('#hashtagSuggest').innerHTML='';return;}
+    $('#hashtagSuggest').innerHTML=`<div style="margin-bottom:4px">${t('hashtags_heading')}</div>`+
+      tags.map(h=>`<span class="subdl" style="cursor:default;margin:3px 4px 0 0">#${esc(h.tag)} · ${h.count}</span>`).join('');
+  }catch(e){}
+}
+function doLibraryExport(){
+  const sort=$('#libsort').value;
+  window.location.href='/api/library/export?sort='+encodeURIComponent(sort);
 }
 $('#go').addEventListener('click',submit);
 $('#search').addEventListener('click',search);
+$('#exportLib').addEventListener('click',doLibraryExport);
 applyLanguage();
+loadHashtagSuggestions();
 poll();
 </script>
 </body></html>"""
