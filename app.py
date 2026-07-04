@@ -697,6 +697,36 @@ if not os.environ.get("VIDCAPTURE_WORKER"):
     threading.Thread(target=cleanup_loop, daemon=True).start()
 
 # ── routes ────────────────────────────────────────────────────────────────────
+@app.get("/healthz")
+def healthz():
+    checks = {}
+    ok = True
+
+    try:
+        redis_conn.ping()
+        checks["redis"] = "ok"
+    except Exception as e:
+        checks["redis"] = "error: %s" % e
+        ok = False
+
+    try:
+        with db() as c:
+            c.execute("SELECT 1").fetchone()
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = "error: %s" % e
+        ok = False
+
+    try:
+        checks["disk"] = "ok" if has_disk_space() else "low"
+        if checks["disk"] != "ok":
+            ok = False
+    except Exception as e:
+        checks["disk"] = "error: %s" % e
+        ok = False
+
+    return jsonify({"status": "ok" if ok else "degraded", "checks": checks}), (200 if ok else 503)
+
 @app.route("/")
 def index():
     return render_template_string(APP_HTML)
