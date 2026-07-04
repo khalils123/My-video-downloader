@@ -31,7 +31,7 @@ RQ_QUEUE_NAME (default video-downloader), RQ_JOB_TIMEOUT_SEC.
 Needs on the server: python3, ffmpeg, yt-dlp, redis-server, and (optional,
 for photo/gallery posts yt-dlp can't parse) gallery-dl.
 """
-import os, re, json, time, uuid, shutil, socket, ipaddress, sqlite3, threading, subprocess, zipfile
+import os, re, json, time, uuid, shutil, socket, ipaddress, sqlite3, threading, subprocess
 from flask import (Flask, request, jsonify,
                    send_file, render_template_string, abort)
 import redis as redis_lib
@@ -217,7 +217,7 @@ def is_safe_url(url):
     return True
 
 # ── job store (Redis-backed; survives web-process restarts) ─────────────────
-_JOB_JSON_FIELDS = {"meta", "subs"}
+_JOB_JSON_FIELDS = {"meta", "subs", "photos"}
 _JOB_FLOAT_FIELDS = {"progress", "created"}
 _JOB_INT_FIELDS = {"size"}
 _JOB_BOOL_FIELDS = {"captions", "watermark"}
@@ -453,15 +453,12 @@ def run_job(job_id):
         is_slideshow = bool(images) and not videos
 
         if is_slideshow:
-            # TikTok/Instagram "photo mode" post: bundle images (+ any audio
-            # track) into one zip so the existing single-file-per-job
-            # download flow keeps working unchanged.
+            # TikTok/Instagram "photo mode" post: no single "video" file to
+            # save, so expose each image (and any audio track) as its own
+            # download link instead of a zip, same pattern as captions below.
             job["status"] = "packaging"
-            zip_path = os.path.join(outdir, "slideshow.zip")
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                for f in images + audios:
-                    zf.write(os.path.join(outdir, f), arcname=f)
-            primary = zip_path
+            job["photos"] = images
+            primary = os.path.join(outdir, audios[0]) if audios else None
         else:
             media = videos + audios
             if not media:
@@ -493,8 +490,8 @@ def run_job(job_id):
                     primary = dst
 
         job["file"] = primary
-        job["filename"] = os.path.basename(primary)
-        job["size"] = os.path.getsize(primary)
+        job["filename"] = os.path.basename(primary) if primary else None
+        job["size"] = os.path.getsize(primary) if primary else 0
         job["subs"] = sorted(f for f in os.listdir(outdir) if f.endswith((".srt", ".vtt")))
         job["progress"] = 100.0
         job["status"] = "done"
@@ -578,7 +575,7 @@ def submit():
                    convert_mode=convert_mode, captions=captions,
                    watermark=watermark, watermark_pos=watermark_pos,
                    status="queued", progress=0.0, file=None,
-                   filename=None, error=None, meta={}, subs=[],
+                   filename=None, error=None, meta={}, subs=[], photos=[],
                    created=time.time())
         job_queue.enqueue(run_job, jid, job_timeout=RQ_JOB_TIMEOUT_SEC)
         created.append(jid)
@@ -586,7 +583,7 @@ def submit():
 
 @app.get("/api/jobs")
 def list_jobs():
-    keys = ("id", "url", "status", "progress", "filename", "error", "size", "meta", "subs")
+    keys = ("id", "url", "status", "progress", "filename", "error", "size", "meta", "subs", "photos")
     out = []
     for jid in list_job_ids():
         j = get_job_dict(jid)
@@ -622,6 +619,19 @@ def sub(jid, idx):
     if not path.startswith(os.path.realpath(DOWNLOAD_DIR)) or not os.path.exists(path):
         abort(404)
     return send_file(path, as_attachment=True, download_name=subs[idx])
+
+@app.get("/api/jobs/<jid>/photo/<int:idx>")
+def photo(jid, idx):
+    j = get_job_dict(jid)
+    if not j:
+        abort(404)
+    photos = j.get("photos") or []
+    if idx < 0 or idx >= len(photos):
+        abort(404)
+    path = os.path.realpath(os.path.join(DOWNLOAD_DIR, jid, photos[idx]))
+    if not path.startswith(os.path.realpath(DOWNLOAD_DIR)) or not os.path.exists(path):
+        abort(404)
+    return send_file(path, as_attachment=True, download_name=photos[idx])
 
 @app.get("/api/library")
 def library():
@@ -763,7 +773,7 @@ function render(list){
     const cls=j.status==='done'?'done':j.status==='error'?'error':'';
     const pct=Math.round(j.progress||0);
     return `<div class="job">
-      <div class="t">${j.filename?esc(j.filename):'Fetching…'}</div>
+      <div class="t">${j.filename?esc(j.filename):(j.status==='done'?(j.photos&&j.photos.length?j.photos.length+' photo(s)':'Done'):'Fetching…')}</div>
       <div class="u">${esc(j.url||'')}</div>
       ${metaLine(j.meta)?`<div class="meta">${metaLine(j.meta)}</div>`:''}
       <div class="bar ${cls}"><i style="width:${pct}%"></i></div>
@@ -779,11 +789,12 @@ function subLabel(s){const p=s.split('.');return p.length>=2?p[p.length-2]:'srt'
 function copyDesc(el){navigator.clipboard.writeText(el.getAttribute('data-desc')||'');const t=el.textContent;el.textContent='Copied ✓';setTimeout(()=>el.textContent=t,1200);}
 function doneExtra(j){
   const m=j.meta||{};
-  const save=`<div><a class="dl" href="/api/jobs/${j.id}/file">Save file</a></div>`;
+  const save=j.filename?`<div><a class="dl" href="/api/jobs/${j.id}/file">Save file</a></div>`:'';
+  const photos=(j.photos&&j.photos.length)?`<div class="subrow">Photos: ${j.photos.map((p,i)=>`<a class="subdl" href="/api/jobs/${j.id}/photo/${i}">Photo ${i+1}</a>`).join('')}</div>`:'';
   const tags=(m.hashtags&&m.hashtags.length)?`<div class="tags">${m.hashtags.map(h=>'#'+esc(h)).join(' ')}</div>`:'';
   const subs=(j.subs&&j.subs.length)?`<div class="subrow">Captions: ${j.subs.map((s,i)=>`<a class="subdl" href="/api/jobs/${j.id}/sub/${i}">${esc(subLabel(s))}</a>`).join('')}</div>`:'';
   const desc=m.description?`<div style="margin-top:7px"><span class="subdl" data-desc="${esc(m.description)}" onclick="copyDesc(this)">Copy description</span></div>`:'';
-  return save+tags+subs+desc;
+  return save+photos+tags+subs+desc;
 }
 async function del(id){await fetch('/api/jobs/'+id+'/delete',{method:'POST'});poll();}
 async function poll(){
