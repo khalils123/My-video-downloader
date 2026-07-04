@@ -39,10 +39,21 @@ from rq import Queue
 
 DOWNLOAD_DIR        = os.environ.get("DOWNLOAD_DIR", "/var/lib/vidcapture")
 FILE_TTL_MIN        = int(os.environ.get("FILE_TTL_MIN", "60"))
-YTDLP               = shutil.which("yt-dlp") or "yt-dlp"
-FFMPEG              = shutil.which("ffmpeg") or "ffmpeg"
-FFPROBE             = shutil.which("ffprobe") or "ffprobe"
-GALLERYDL           = shutil.which("gallery-dl")  # optional: fallback for photo/gallery posts yt-dlp can't parse
+def _find_binary(name):
+    """shutil.which() alone can miss binaries installed only in the venv if
+    the caller's PATH doesn't include venv/bin (e.g. a systemd unit that
+    invokes python3 by absolute path without setting Environment=PATH=...).
+    Fall back to checking venv/bin directly, relative to this file."""
+    found = shutil.which(name)
+    if found:
+        return found
+    venv_candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venv", "bin", name)
+    return venv_candidate if os.path.exists(venv_candidate) else None
+
+YTDLP               = _find_binary("yt-dlp") or "yt-dlp"
+FFMPEG              = _find_binary("ffmpeg") or "ffmpeg"
+FFPROBE             = _find_binary("ffprobe") or "ffprobe"
+GALLERYDL           = _find_binary("gallery-dl")  # optional: fallback for photo/gallery posts yt-dlp can't parse
 GALLERYDL_TIMEOUT_SEC = int(os.environ.get("GALLERYDL_TIMEOUT_SEC", "300"))
 WATERMARK_TIMEOUT_SEC = int(os.environ.get("WATERMARK_TIMEOUT_SEC", "300"))
 MAX_URLS_PER_REQUEST = int(os.environ.get("MAX_URLS_PER_REQUEST", "10"))
