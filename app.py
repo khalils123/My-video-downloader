@@ -12,21 +12,29 @@ Adds on top of v1:
                     only (e.g. cross-posting your own video to another platform without
                     double branding) — not for stripping other creators' marks.
 
-Env vars (see README): DOWNLOAD_DIR, MAX_CONCURRENT (default 2),
+Jobs are queued via Redis/RQ (see worker.py) instead of in-process threads,
+so job state survives a web-process restart/redeploy and concurrency is
+controlled by how many `worker.py` processes you run (not MAX_CONCURRENT,
+which no longer exists — run more worker instances for more concurrency).
+
+Env vars (see README): DOWNLOAD_DIR,
 FILE_TTL_MIN (default 60), MAX_URLS_PER_REQUEST (default 10),
 DOWNLOAD_TIMEOUT_SEC (default 1800), CONVERT_TIMEOUT_SEC (default 600),
 RATE_LIMIT_MAX / RATE_LIMIT_WINDOW_SEC (default 5 per 60s per IP),
 MIN_FREE_DISK_MB (default 1024), ALLOWED_DOMAINS (comma-separated
 hostnames; empty = allow all), MAX_FILE_SIZE_MB (default 2048),
-YTDLP_MAX_RETRIES / YTDLP_RETRY_BACKOFF_SEC (default 2 retries, 5s backoff).
-Needs on the server: python3, ffmpeg, and yt-dlp (installed in the venv).
+YTDLP_MAX_RETRIES / YTDLP_RETRY_BACKOFF_SEC (default 2 retries, 5s backoff),
+REDIS_HOST / REDIS_PORT / REDIS_DB (default localhost:6379/0),
+RQ_QUEUE_NAME (default video-downloader), RQ_JOB_TIMEOUT_SEC.
+Needs on the server: python3, ffmpeg, yt-dlp, and redis-server.
 """
 import os, re, json, time, uuid, shutil, socket, ipaddress, sqlite3, threading, subprocess
 from flask import (Flask, request, jsonify,
                    send_file, render_template_string, abort)
+import redis as redis_lib
+from rq import Queue
 
 DOWNLOAD_DIR        = os.environ.get("DOWNLOAD_DIR", "/var/lib/vidcapture")
-MAX_CONCURRENT      = int(os.environ.get("MAX_CONCURRENT", "2"))
 FILE_TTL_MIN        = int(os.environ.get("FILE_TTL_MIN", "60"))
 YTDLP               = shutil.which("yt-dlp") or "yt-dlp"
 FFMPEG              = shutil.which("ffmpeg") or "ffmpeg"
@@ -42,14 +50,25 @@ ALLOWED_DOMAINS     = [d.strip().lower() for d in os.environ.get("ALLOWED_DOMAIN
 MAX_FILE_SIZE_MB    = int(os.environ.get("MAX_FILE_SIZE_MB", "2048"))
 YTDLP_MAX_RETRIES   = int(os.environ.get("YTDLP_MAX_RETRIES", "2"))
 YTDLP_RETRY_BACKOFF_SEC = int(os.environ.get("YTDLP_RETRY_BACKOFF_SEC", "5"))
+REDIS_HOST          = os.environ.get("REDIS_HOST", "localhost")
+REDIS_PORT          = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_DB            = int(os.environ.get("REDIS_DB", "0"))
+RQ_QUEUE_NAME       = os.environ.get("RQ_QUEUE_NAME", "video-downloader")
+RQ_JOB_TIMEOUT_SEC  = int(os.environ.get("RQ_JOB_TIMEOUT_SEC",
+                          str(DOWNLOAD_TIMEOUT_SEC + CONVERT_TIMEOUT_SEC + WATERMARK_TIMEOUT_SEC + 300)))
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024  # 1MB: plenty for a list of URLs
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 DB = os.path.join(DOWNLOAD_DIR, "library.db")
 
-jobs = {}
-sem = threading.Semaphore(MAX_CONCURRENT)
+redis_conn = redis_lib.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
+# RQ stores pickled binary job payloads internally, so it needs its own
+# connection WITHOUT decode_responses (which would break on non-UTF-8 bytes).
+rq_redis_conn = redis_lib.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=False)
+job_queue = Queue(RQ_QUEUE_NAME, connection=rq_redis_conn)
+JOB_KEY_PREFIX = "vidcapture:job:"
+JOB_INDEX_KEY = "vidcapture:jobs:index"
 
 _rate_lock = threading.Lock()
 _rate_hits = {}
@@ -133,6 +152,89 @@ def is_safe_url(url):
                 or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
             return False
     return True
+
+# ── job store (Redis-backed; survives web-process restarts) ─────────────────
+_JOB_JSON_FIELDS = {"meta", "subs"}
+_JOB_FLOAT_FIELDS = {"progress", "created"}
+_JOB_INT_FIELDS = {"size"}
+_JOB_BOOL_FIELDS = {"captions", "watermark"}
+
+def _encode_field(key, value):
+    if value is None:
+        return ""
+    if key in _JOB_JSON_FIELDS:
+        return json.dumps(value)
+    if key in _JOB_BOOL_FIELDS:
+        return "1" if value else "0"
+    return str(value)
+
+def _decode_field(key, raw):
+    if raw is None or raw == "":
+        if key in _JOB_JSON_FIELDS:
+            return {} if key == "meta" else []
+        return None
+    if key in _JOB_JSON_FIELDS:
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return {} if key == "meta" else []
+    if key in _JOB_FLOAT_FIELDS:
+        try:
+            return float(raw)
+        except ValueError:
+            return 0.0
+    if key in _JOB_INT_FIELDS:
+        try:
+            return int(raw)
+        except ValueError:
+            return 0
+    if key in _JOB_BOOL_FIELDS:
+        return raw == "1"
+    return raw
+
+class RedisJob:
+    """Dict-like view over a job's Redis hash, read/written field-by-field."""
+    __slots__ = ("id",)
+
+    def __init__(self, jid):
+        self.id = jid
+
+    def _key(self):
+        return JOB_KEY_PREFIX + self.id
+
+    def __getitem__(self, key):
+        return _decode_field(key, redis_conn.hget(self._key(), key))
+
+    def get(self, key, default=None):
+        raw = redis_conn.hget(self._key(), key)
+        if raw is None:
+            return default
+        return _decode_field(key, raw)
+
+    def __setitem__(self, key, value):
+        redis_conn.hset(self._key(), key, _encode_field(key, value))
+
+    def exists(self):
+        return redis_conn.exists(self._key()) == 1
+
+def create_job(jid, **fields):
+    key = JOB_KEY_PREFIX + jid
+    mapping = {k: _encode_field(k, v) for k, v in fields.items()}
+    redis_conn.hset(key, mapping=mapping)
+    redis_conn.zadd(JOB_INDEX_KEY, {jid: fields.get("created") or time.time()})
+
+def get_job_dict(jid):
+    raw = redis_conn.hgetall(JOB_KEY_PREFIX + jid)
+    if not raw:
+        return None
+    return {k: _decode_field(k, v) for k, v in raw.items()}
+
+def list_job_ids(limit=10000):
+    return redis_conn.zrevrange(JOB_INDEX_KEY, 0, limit - 1)
+
+def delete_job_record(jid):
+    redis_conn.delete(JOB_KEY_PREFIX + jid)
+    redis_conn.zrem(JOB_INDEX_KEY, jid)
 
 def load_meta(outdir):
     for f in os.listdir(outdir):
@@ -234,117 +336,124 @@ def _run_ytdlp_once(cmd, job):
     return proc.returncode, timed_out
 
 def run_job(job_id):
-    with sem:
-        job = jobs.get(job_id)
-        if not job:
-            return
-        job["status"] = "downloading"
-        outdir = os.path.join(DOWNLOAD_DIR, job_id)
-        os.makedirs(outdir, exist_ok=True)
-        fmt = FORMATS.get(job["format"], FORMATS["1080"])
-        outtmpl = os.path.join(outdir, "%(title).150B.%(ext)s")
-        cmd = [YTDLP, "-f", fmt, "-o", outtmpl, "--no-playlist", "--newline",
-               "--restrict-filenames", "--no-mtime", "--no-progress",
-               "--write-info-json", "--embed-metadata",
-               "--max-filesize", "%dM" % MAX_FILE_SIZE_MB]
-        if job.get("captions"):
-            cmd += ["--write-subs", "--write-auto-subs", "--sub-langs", "all", "--convert-subs", "srt"]
-        if job["format"] == "audio":
-            cmd += ["--extract-audio", "--audio-format", "mp3"]
-        else:
-            cmd += ["--merge-output-format", "mp4"]
-        cmd.append(job["url"])
-        try:
-            attempts = YTDLP_MAX_RETRIES + 1
-            returncode, timed_out = 1, False
-            for attempt in range(attempts):
-                job["progress"] = 0.0
-                returncode, timed_out = _run_ytdlp_once(cmd, job)
-                if returncode == 0 or timed_out:
-                    break
-                if attempt < attempts - 1:
-                    job["status"] = "retrying"
-                    time.sleep(YTDLP_RETRY_BACKOFF_SEC)
-                    job["status"] = "downloading"
-            if returncode != 0:
-                job["status"] = "error"
-                job["error"] = ("Download timed out." if timed_out else
-                                "Download failed after %d attempt(s). The site may be unsupported, "
-                                "the link protected/expired/region-locked, or the file exceeds the "
-                                "%dMB size cap." % (attempts, MAX_FILE_SIZE_MB))
-                return
-
-            media = [f for f in os.listdir(outdir)
-                     if not f.endswith((".part", ".info.json", ".webp", ".jpg", ".png", ".srt", ".vtt"))]
-            if not media:
-                job["status"] = "error"
-                job["error"] = "No file was produced."
-                return
-            media.sort(key=lambda f: os.path.getsize(os.path.join(outdir, f)), reverse=True)
-            primary = os.path.join(outdir, media[0])
-
-            # optional watermark removal (your own content only; video only)
-            wm_pos = job.get("watermark_pos")
-            if job.get("watermark") and wm_pos in WATERMARK_PRESETS and job["format"] != "audio":
-                job["status"] = "watermarking"
-                base = os.path.splitext(media[0])[0]
-                dst = os.path.join(outdir, "%s.nowm.mp4" % base)
-                if remove_watermark(primary, dst, WATERMARK_PRESETS[wm_pos]) and os.path.exists(dst):
-                    primary = dst
-
-            # optional aspect-ratio conversion (video only)
-            ratio = job.get("convert")
-            if ratio in CANVAS and job["format"] != "audio":
-                job["status"] = "converting"
-                base = os.path.splitext(media[0])[0]
-                dst = os.path.join(outdir, "%s.%s.mp4" % (base, ratio))
-                rc = convert_aspect(primary, dst, ratio, job.get("convert_mode", "blur"))
-                if rc == 0 and os.path.exists(dst):
-                    primary = dst
-
-            job["file"] = primary
-            job["filename"] = os.path.basename(primary)
-            job["size"] = os.path.getsize(primary)
-            job["subs"] = sorted(f for f in os.listdir(outdir) if f.endswith((".srt", ".vtt")))
-            job["progress"] = 100.0
-            job["status"] = "done"
-
-            meta = load_meta(outdir)
-            job["meta"] = meta
-            try:
-                with db() as c:
-                    c.execute("""INSERT OR REPLACE INTO library
-                        (id,url,title,uploader,upload_date,duration,view_count,like_count,tags,filename,size,created)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (job_id, job["url"], meta.get("title"), meta.get("uploader"),
-                         meta.get("upload_date"), meta.get("duration"), meta.get("view_count"),
-                         meta.get("like_count"), meta.get("tags"), job["filename"],
-                         job["size"], job["created"]))
-            except Exception:
-                pass
-        except Exception as e:  # noqa: BLE001
+    """RQ task entry point. Concurrency = number of running worker.py processes."""
+    job = RedisJob(job_id)
+    if not job.exists():
+        return
+    job["status"] = "downloading"
+    outdir = os.path.join(DOWNLOAD_DIR, job_id)
+    os.makedirs(outdir, exist_ok=True)
+    fmt = FORMATS.get(job["format"], FORMATS["1080"])
+    outtmpl = os.path.join(outdir, "%(title).150B.%(ext)s")
+    cmd = [YTDLP, "-f", fmt, "-o", outtmpl, "--no-playlist", "--newline",
+           "--restrict-filenames", "--no-mtime", "--no-progress",
+           "--write-info-json", "--embed-metadata",
+           "--max-filesize", "%dM" % MAX_FILE_SIZE_MB]
+    if job.get("captions"):
+        cmd += ["--write-subs", "--write-auto-subs", "--sub-langs", "all", "--convert-subs", "srt"]
+    if job["format"] == "audio":
+        cmd += ["--extract-audio", "--audio-format", "mp3"]
+    else:
+        cmd += ["--merge-output-format", "mp4"]
+    cmd.append(job["url"])
+    try:
+        attempts = YTDLP_MAX_RETRIES + 1
+        returncode, timed_out = 1, False
+        for attempt in range(attempts):
+            job["progress"] = 0.0
+            returncode, timed_out = _run_ytdlp_once(cmd, job)
+            if returncode == 0 or timed_out:
+                break
+            if attempt < attempts - 1:
+                job["status"] = "retrying"
+                time.sleep(YTDLP_RETRY_BACKOFF_SEC)
+                job["status"] = "downloading"
+        if returncode != 0:
             job["status"] = "error"
-            job["error"] = "Server error: " + str(e)
+            job["error"] = ("Download timed out." if timed_out else
+                            "Download failed after %d attempt(s). The site may be unsupported, "
+                            "the link protected/expired/region-locked, or the file exceeds the "
+                            "%dMB size cap." % (attempts, MAX_FILE_SIZE_MB))
+            return
+
+        media = [f for f in os.listdir(outdir)
+                 if not f.endswith((".part", ".info.json", ".webp", ".jpg", ".png", ".srt", ".vtt"))]
+        if not media:
+            job["status"] = "error"
+            job["error"] = "No file was produced."
+            return
+        media.sort(key=lambda f: os.path.getsize(os.path.join(outdir, f)), reverse=True)
+        primary = os.path.join(outdir, media[0])
+
+        # optional watermark removal (your own content only; video only)
+        wm_pos = job.get("watermark_pos")
+        if job.get("watermark") and wm_pos in WATERMARK_PRESETS and job["format"] != "audio":
+            job["status"] = "watermarking"
+            base = os.path.splitext(media[0])[0]
+            dst = os.path.join(outdir, "%s.nowm.mp4" % base)
+            if remove_watermark(primary, dst, WATERMARK_PRESETS[wm_pos]) and os.path.exists(dst):
+                primary = dst
+
+        # optional aspect-ratio conversion (video only)
+        ratio = job.get("convert")
+        if ratio in CANVAS and job["format"] != "audio":
+            job["status"] = "converting"
+            base = os.path.splitext(media[0])[0]
+            dst = os.path.join(outdir, "%s.%s.mp4" % (base, ratio))
+            rc = convert_aspect(primary, dst, ratio, job.get("convert_mode", "blur"))
+            if rc == 0 and os.path.exists(dst):
+                primary = dst
+
+        job["file"] = primary
+        job["filename"] = os.path.basename(primary)
+        job["size"] = os.path.getsize(primary)
+        job["subs"] = sorted(f for f in os.listdir(outdir) if f.endswith((".srt", ".vtt")))
+        job["progress"] = 100.0
+        job["status"] = "done"
+
+        meta = load_meta(outdir)
+        job["meta"] = meta
+        try:
+            with db() as c:
+                c.execute("""INSERT OR REPLACE INTO library
+                    (id,url,title,uploader,upload_date,duration,view_count,like_count,tags,filename,size,created)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (job_id, job["url"], meta.get("title"), meta.get("uploader"),
+                     meta.get("upload_date"), meta.get("duration"), meta.get("view_count"),
+                     meta.get("like_count"), meta.get("tags"), job["filename"],
+                     job["size"], job["created"]))
+        except Exception:
+            pass
+    except Exception as e:  # noqa: BLE001
+        job["status"] = "error"
+        job["error"] = "Server error: " + str(e)
 
 def cleanup_loop():
     while True:
         now = time.time()
-        for jid, j in list(jobs.items()):
-            if now - j.get("created", now) > FILE_TTL_MIN * 60:
+        for jid in list_job_ids():
+            j = get_job_dict(jid)
+            created = j.get("created") if j else None
+            if created is None or now - created > FILE_TTL_MIN * 60:
+                delete_job_record(jid)
                 shutil.rmtree(os.path.join(DOWNLOAD_DIR, jid), ignore_errors=True)
-                jobs.pop(jid, None)
-        # sweep orphaned job directories left behind by a service restart
+        # sweep orphaned job directories with no matching Redis record
+        # (e.g. left behind by a Redis flush or an old in-memory-jobs deploy)
         try:
             for name in os.listdir(DOWNLOAD_DIR):
                 path = os.path.join(DOWNLOAD_DIR, name)
-                if name in jobs or not os.path.isdir(path):
+                if not os.path.isdir(path) or redis_conn.exists(JOB_KEY_PREFIX + name):
                     continue
                 if now - os.path.getmtime(path) > FILE_TTL_MIN * 60:
                     shutil.rmtree(path, ignore_errors=True)
         except OSError:
             pass
         time.sleep(300)
-threading.Thread(target=cleanup_loop, daemon=True).start()
+
+# Only the web process runs cleanup — worker.py sets VIDCAPTURE_WORKER before
+# importing this module so N worker processes don't all sweep redundantly.
+if not os.environ.get("VIDCAPTURE_WORKER"):
+    threading.Thread(target=cleanup_loop, daemon=True).start()
 
 # ── routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
@@ -377,32 +486,35 @@ def submit():
         if not is_safe_url(u) or not domain_allowed(u):
             continue
         jid = uuid.uuid4().hex[:12]
-        jobs[jid] = {"id": jid, "url": u, "format": fmt, "convert": convert,
-                     "convert_mode": convert_mode, "captions": captions,
-                     "watermark": watermark, "watermark_pos": watermark_pos,
-                     "status": "queued", "progress": 0.0, "file": None,
-                     "filename": None, "error": None, "meta": {}, "subs": [],
-                     "created": time.time()}
-        threading.Thread(target=run_job, args=(jid,), daemon=True).start()
+        create_job(jid, id=jid, url=u, format=fmt, convert=convert,
+                   convert_mode=convert_mode, captions=captions,
+                   watermark=watermark, watermark_pos=watermark_pos,
+                   status="queued", progress=0.0, file=None,
+                   filename=None, error=None, meta={}, subs=[],
+                   created=time.time())
+        job_queue.enqueue(run_job, jid, job_timeout=RQ_JOB_TIMEOUT_SEC)
         created.append(jid)
     return jsonify({"created": created})
 
 @app.get("/api/jobs")
 def list_jobs():
     keys = ("id", "url", "status", "progress", "filename", "error", "size", "meta", "subs")
-    out = [{k: j.get(k) for k in keys}
-           for j in sorted(jobs.values(), key=lambda x: x["created"], reverse=True)]
+    out = []
+    for jid in list_job_ids():
+        j = get_job_dict(jid)
+        if j:
+            out.append({k: j.get(k) for k in keys})
     return jsonify({"jobs": out})
 
 @app.post("/api/jobs/<jid>/delete")
 def delete_job(jid):
-    jobs.pop(jid, None)
+    delete_job_record(jid)
     shutil.rmtree(os.path.join(DOWNLOAD_DIR, jid), ignore_errors=True)
     return jsonify({"ok": True})
 
 @app.get("/api/jobs/<jid>/file")
 def download(jid):
-    j = jobs.get(jid)
+    j = get_job_dict(jid)
     if not j or j.get("status") != "done" or not j.get("file"):
         abort(404)
     path = os.path.realpath(j["file"])
@@ -412,7 +524,7 @@ def download(jid):
 
 @app.get("/api/jobs/<jid>/sub/<int:idx>")
 def sub(jid, idx):
-    j = jobs.get(jid)
+    j = get_job_dict(jid)
     if not j:
         abort(404)
     subs = j.get("subs") or []

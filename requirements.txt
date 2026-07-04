@@ -1,0 +1,5 @@
+Flask
+gunicorn
+redis
+rq
+yt-dlp
