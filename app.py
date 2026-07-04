@@ -36,7 +36,7 @@ RQ_QUEUE_NAME (default video-downloader), RQ_JOB_TIMEOUT_SEC.
 Needs on the server: python3, ffmpeg, yt-dlp, redis-server, and (optional,
 for photo/gallery posts yt-dlp can't parse) gallery-dl.
 """
-import os, re, json, time, uuid, shutil, socket, ipaddress, sqlite3, threading, subprocess
+import os, re, json, time, uuid, shutil, socket, ipaddress, sqlite3, threading, subprocess, hashlib, zipfile, csv, io
 from flask import (Flask, request, jsonify,
                    send_file, render_template_string, abort)
 import redis as redis_lib
@@ -72,6 +72,7 @@ MAX_FILE_SIZE_MB    = int(os.environ.get("MAX_FILE_SIZE_MB", "2048"))
 YTDLP_MAX_RETRIES   = int(os.environ.get("YTDLP_MAX_RETRIES", "2"))
 YTDLP_RETRY_BACKOFF_SEC = int(os.environ.get("YTDLP_RETRY_BACKOFF_SEC", "5"))
 PREVIEW_TIMEOUT_SEC = int(os.environ.get("PREVIEW_TIMEOUT_SEC", "20"))
+MAX_EXPORT_JOBS     = int(os.environ.get("MAX_EXPORT_JOBS", "20"))
 REDIS_HOST          = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT          = int(os.environ.get("REDIS_PORT", "6379"))
 REDIS_DB            = int(os.environ.get("REDIS_DB", "0"))
@@ -172,7 +173,26 @@ def init_db():
             id TEXT PRIMARY KEY, url TEXT, title TEXT, uploader TEXT, upload_date TEXT,
             duration REAL, view_count INTEGER, like_count INTEGER, tags TEXT,
             filename TEXT, size INTEGER, created REAL)""")
+        cols = {row["name"] for row in c.execute("PRAGMA table_info(library)")}
+        if "content_hash" not in cols:
+            c.execute("ALTER TABLE library ADD COLUMN content_hash TEXT")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_library_hash ON library(content_hash)")
 init_db()
+
+def file_sha256(path, chunk_size=1024 * 1024):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def find_duplicate(content_hash, exclude_job_id):
+    if not content_hash:
+        return None
+    with db() as c:
+        row = c.execute("SELECT title, uploader, created FROM library WHERE content_hash=? AND id!=? "
+                        "ORDER BY created DESC LIMIT 1", (content_hash, exclude_job_id)).fetchone()
+    return dict(row) if row else None
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 def client_ip():
@@ -223,7 +243,8 @@ def is_safe_url(url):
     return True
 
 # ── job store (Redis-backed; survives web-process restarts) ─────────────────
-_JOB_JSON_FIELDS = {"meta", "subs", "photos", "served_photos", "served_subs"}
+_JOB_JSON_FIELDS = {"meta", "subs", "photos", "served_photos", "served_subs", "duplicate"}
+_JOB_JSON_DICT_FIELDS = {"meta", "duplicate"}  # these default to {} empty; others default to []
 _JOB_FLOAT_FIELDS = {"progress", "created"}
 _JOB_INT_FIELDS = {"size"}
 _JOB_BOOL_FIELDS = {"captions", "watermark", "served_file"}
@@ -240,13 +261,13 @@ def _encode_field(key, value):
 def _decode_field(key, raw):
     if raw is None or raw == "":
         if key in _JOB_JSON_FIELDS:
-            return {} if key == "meta" else []
+            return {} if key in _JOB_JSON_DICT_FIELDS else []
         return None
     if key in _JOB_JSON_FIELDS:
         try:
             return json.loads(raw)
         except (TypeError, ValueError):
-            return {} if key == "meta" else []
+            return {} if key in _JOB_JSON_DICT_FIELDS else []
     if key in _JOB_FLOAT_FIELDS:
         try:
             return float(raw)
@@ -335,6 +356,39 @@ def mark_served_and_maybe_cleanup(jid, kind, idx=None):
     j = get_job_dict(jid)
     if j and all_files_served(j):
         delete_job_record(jid)
+
+class _OnCloseWrapper:
+    """send_file() responses use direct_passthrough=True, which makes Werkzeug's
+    get_app_iter() hand the WSGI server response.response directly — bypassing
+    the ClosingIterator that would normally call Response.close() (and thus
+    Response.call_on_close callbacks). The real WSGI server only ever calls
+    .close() on *this* object, so the cleanup hook has to live here instead."""
+    __slots__ = ("_wrapped", "_callback", "_done")
+
+    def __init__(self, wrapped, callback):
+        self._wrapped = wrapped
+        self._callback = callback
+        self._done = False
+
+    def __iter__(self):
+        return iter(self._wrapped)
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
+
+    def close(self):
+        try:
+            close = getattr(self._wrapped, "close", None)
+            if close:
+                close()
+        finally:
+            if not self._done:
+                self._done = True
+                self._callback()
+
+def on_response_close(resp, callback):
+    resp.response = _OnCloseWrapper(resp.response, callback)
+    return resp
 
 def load_meta(outdir):
     for f in os.listdir(outdir):
@@ -533,17 +587,27 @@ def run_job(job_id):
         job["progress"] = 100.0
         job["status"] = "done"
 
+        # duplicate detection: hash the primary file and check past downloads
+        # (skipped for photo posts with no single "file" to hash)
+        content_hash = None
+        if primary:
+            try:
+                content_hash = file_sha256(primary)
+                job["duplicate"] = find_duplicate(content_hash, job_id) or {}
+            except OSError:
+                pass
+
         meta = load_meta(outdir)
         job["meta"] = meta
         try:
             with db() as c:
                 c.execute("""INSERT OR REPLACE INTO library
-                    (id,url,title,uploader,upload_date,duration,view_count,like_count,tags,filename,size,created)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (id,url,title,uploader,upload_date,duration,view_count,like_count,tags,filename,size,created,content_hash)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (job_id, job["url"], meta.get("title"), meta.get("uploader"),
                      meta.get("upload_date"), meta.get("duration"), meta.get("view_count"),
                      meta.get("like_count"), meta.get("tags"), job["filename"],
-                     job["size"], job["created"]))
+                     job["size"], job["created"], content_hash))
         except Exception:
             pass
     except Exception as e:  # noqa: BLE001
@@ -644,7 +708,7 @@ def submit():
                    watermark=watermark, watermark_pos=watermark_pos,
                    status="queued", progress=0.0, file=None,
                    filename=None, error=None, meta={}, subs=[], photos=[],
-                   served_file=False, served_photos=[], served_subs=[],
+                   served_file=False, served_photos=[], served_subs=[], duplicate={},
                    created=time.time())
         job_queue.enqueue(run_job, jid, job_timeout=RQ_JOB_TIMEOUT_SEC)
         created.append(jid)
@@ -652,7 +716,7 @@ def submit():
 
 @app.get("/api/jobs")
 def list_jobs():
-    keys = ("id", "url", "status", "progress", "filename", "error", "size", "meta", "subs", "photos")
+    keys = ("id", "url", "status", "progress", "filename", "error", "size", "meta", "subs", "photos", "duplicate")
     out = []
     for jid in list_job_ids():
         j = get_job_dict(jid)
@@ -674,8 +738,7 @@ def download(jid):
     if not path.startswith(os.path.realpath(DOWNLOAD_DIR)) or not os.path.exists(path):
         abort(404)
     resp = send_file(path, as_attachment=True, download_name=j["filename"])
-    resp.call_on_close(lambda: mark_served_and_maybe_cleanup(jid, "file"))
-    return resp
+    return on_response_close(resp, lambda: mark_served_and_maybe_cleanup(jid, "file"))
 
 @app.get("/api/jobs/<jid>/sub/<int:idx>")
 def sub(jid, idx):
@@ -689,8 +752,7 @@ def sub(jid, idx):
     if not path.startswith(os.path.realpath(DOWNLOAD_DIR)) or not os.path.exists(path):
         abort(404)
     resp = send_file(path, as_attachment=True, download_name=subs[idx])
-    resp.call_on_close(lambda: mark_served_and_maybe_cleanup(jid, "sub", idx))
-    return resp
+    return on_response_close(resp, lambda: mark_served_and_maybe_cleanup(jid, "sub", idx))
 
 @app.get("/api/jobs/<jid>/photo/<int:idx>")
 def photo(jid, idx):
@@ -704,8 +766,66 @@ def photo(jid, idx):
     if not path.startswith(os.path.realpath(DOWNLOAD_DIR)) or not os.path.exists(path):
         abort(404)
     resp = send_file(path, as_attachment=True, download_name=photos[idx])
-    resp.call_on_close(lambda: mark_served_and_maybe_cleanup(jid, "photo", idx))
-    return resp
+    return on_response_close(resp, lambda: mark_served_and_maybe_cleanup(jid, "photo", idx))
+
+@app.post("/api/export")
+def export():
+    if rate_limited(client_ip()):
+        return jsonify({"error": "Too many requests. Please slow down and try again shortly."}), 429
+    data = request.get_json(silent=True) or {}
+    job_ids = list(dict.fromkeys(data.get("job_ids") or []))[:MAX_EXPORT_JOBS]
+    jobs = [j for j in (get_job_dict(jid) for jid in job_ids) if j and j.get("status") == "done"]
+    if not jobs:
+        return jsonify({"error": "None of the selected downloads are ready to export."}), 400
+
+    export_dir = os.path.join(DOWNLOAD_DIR, "_exports")
+    os.makedirs(export_dir, exist_ok=True)
+    zip_path = os.path.join(export_dir, "%s.zip" % uuid.uuid4().hex[:12])
+
+    fieldnames = ["filename", "title", "uploader", "hashtags", "upload_date", "view_count", "like_count", "url"]
+    rows = []
+    used_names = set()
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for j in jobs:
+            meta = j.get("meta") or {}
+            srcs = ([j["file"]] if j.get("file") else []) + \
+                   [os.path.join(DOWNLOAD_DIR, j["id"], p) for p in (j.get("photos") or [])]
+            for src in srcs:
+                if not os.path.exists(src):
+                    continue
+                arcname = os.path.basename(src)
+                base, ext = os.path.splitext(arcname)
+                candidate, n = arcname, 1
+                while candidate in used_names:
+                    candidate = "%s_%d%s" % (base, n, ext)
+                    n += 1
+                used_names.add(candidate)
+                zf.write(src, arcname=candidate)
+                rows.append({
+                    "filename": candidate, "title": meta.get("title") or "",
+                    "uploader": meta.get("uploader") or "", "hashtags": " ".join(meta.get("hashtags") or []),
+                    "upload_date": meta.get("upload_date") or "", "view_count": meta.get("view_count") or "",
+                    "like_count": meta.get("like_count") or "", "url": j.get("url") or "",
+                })
+        csv_buf = io.StringIO()
+        writer = csv.DictWriter(csv_buf, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+        zf.writestr("manifest.csv", csv_buf.getvalue())
+
+    if not rows:
+        os.remove(zip_path)
+        return jsonify({"error": "None of the selected downloads have files to export."}), 400
+
+    resp = send_file(zip_path, as_attachment=True, download_name="export.zip")
+    def _cleanup():
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        for j in jobs:
+            delete_job_record(j["id"])
+    return on_response_close(resp, _cleanup)
 
 @app.get("/api/library")
 def library():
@@ -840,6 +960,7 @@ APP_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <p class="err" id="submitErr"></p>
  </div>
 
+ <div id="exportBar" class="controls" style="display:none"></div>
  <div id="jobs"></div>
 
  <div class="card">
@@ -877,7 +998,9 @@ const STRINGS={
   lib_ph:'Search your library (title, uploader, tag)',btn_search:'Search',lib_empty:'No saved items yet.',
   save_file:'Save file',photo:'Photo',captions_prefix:'Captions:',photos_prefix:'Photos:',views:'views',
   copy_desc:'Copy description',copied:'Copied ✓',remove:'Remove',fetching:'Fetching…',done_label:'Done',
-  preview_loading:'Loading preview…',preview_failed:'No preview available',lang_name:'اردو'},
+  preview_loading:'Loading preview…',preview_failed:'No preview available',lang_name:'اردو',
+  select_export:'Select',selected:'selected',clear_selection:'Clear',export_zip:'Export as ZIP',
+  duplicate_note:"You've downloaded this before as"},
  ur:{eyebrow:'ذاتی کیپچر',title:'ویڈیو کیپچر',
   banner:'صرف اپنے یا لائسنس یافتہ مواد کے لیے — آپ کی اپنی اپلوڈز، کلائنٹ یا پروڈکٹ فوٹیج، اور پبلک ڈومین / کریئیٹو کامنز مواد۔ واٹر مارک ہٹانا صرف آپ کے اپنے مواد کے لیے ہے۔',
   urls_ph:'ایک یا زیادہ لنکس پیسٹ کریں، ہر لائن میں ایک…',quality:'کوالٹی',fmt_1080:'1080p تک',fmt_720:'720p تک',fmt_best:'بہترین',fmt_audio:'صرف آڈیو (mp3)',
@@ -888,7 +1011,9 @@ const STRINGS={
   lib_ph:'اپنی لائبریری تلاش کریں (عنوان، اپ لوڈر، ٹیگ)',btn_search:'تلاش کریں',lib_empty:'ابھی تک کوئی محفوظ آئٹم نہیں۔',
   save_file:'فائل محفوظ کریں',photo:'تصویر',captions_prefix:'کیپشنز:',photos_prefix:'تصاویر:',views:'ملاحظات',
   copy_desc:'تفصیل کاپی کریں',copied:'کاپی ہو گیا ✓',remove:'ہٹائیں',fetching:'حاصل ہو رہا ہے…',done_label:'مکمل',
-  preview_loading:'پیش منظر لوڈ ہو رہا ہے…',preview_failed:'پیش منظر دستیاب نہیں',lang_name:'English'}
+  preview_loading:'پیش منظر لوڈ ہو رہا ہے…',preview_failed:'پیش منظر دستیاب نہیں',lang_name:'English',
+  select_export:'منتخب کریں',selected:'منتخب',clear_selection:'صاف کریں',export_zip:'ZIP کے طور پر برآمد کریں',
+  duplicate_note:'آپ یہ پہلے ڈاؤن لوڈ کر چکے ہیں بطور'}
 };
 let LANG=localStorage.getItem('lang')||'en';
 function t(key){return (STRINGS[LANG]&&STRINGS[LANG][key])||STRINGS.en[key]||key;}
@@ -900,6 +1025,7 @@ function applyLanguage(){
   $('#lang-toggle').textContent=t('lang_name');
   render(lastJobs);
   renderPreviews();
+  renderExportBar();
 }
 $('#lang-toggle').addEventListener('click',()=>{LANG=LANG==='en'?'ur':'en';localStorage.setItem('lang',LANG);applyLanguage();});
 
@@ -980,11 +1106,55 @@ async function submit(){
 function metaLine(m){if(!m)return'';const p=[];if(m.uploader)p.push(esc(m.uploader));
   if(m.view_count)p.push(m.view_count.toLocaleString()+' '+t('views'));
   if(m.upload_date)p.push(m.upload_date);return p.join(' · ');}
+
+// ── batch export ─────────────────────────────────────────────────────────
+let selectedForExport=new Set();
+function toggleSelect(id,checked){
+  if(checked) selectedForExport.add(id); else selectedForExport.delete(id);
+  renderExportBar();
+}
+function renderExportBar(){
+  const bar=$('#exportBar');
+  if(selectedForExport.size===0){bar.style.display='none';bar.innerHTML='';return;}
+  bar.style.display='flex';
+  bar.innerHTML=`<span class="st">${selectedForExport.size} ${t('selected')}</span>
+    <button class="btn ghost" id="clearSel" style="margin-left:8px">${t('clear_selection')}</button>
+    <button class="btn" id="exportBtn">${t('export_zip')}</button>`;
+  $('#clearSel').addEventListener('click',()=>{selectedForExport.clear();render(lastJobs);renderExportBar();});
+  $('#exportBtn').addEventListener('click',doExport);
+}
+async function doExport(){
+  const ids=[...selectedForExport];
+  if(!ids.length) return;
+  const btn=$('#exportBtn');
+  if(btn) btn.disabled=true;
+  try{
+    const r=await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_ids:ids})});
+    if(!r.ok){
+      const d=await r.json().catch(()=>({}));
+      alert(d.error||'Export failed.');
+      return;
+    }
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;a.download='export.zip';
+    document.body.appendChild(a);a.click();a.remove();
+    URL.revokeObjectURL(url);
+    selectedForExport.clear();
+    poll();
+  }finally{
+    renderExportBar();
+  }
+}
+
 function render(list){
   $('#jobs').innerHTML=list.map(j=>{
     const cls=j.status==='done'?'done':j.status==='error'?'error':'';
     const pct=Math.round(j.progress||0);
     const title=j.filename?esc(j.filename):(j.status==='done'?(j.photos&&j.photos.length?j.photos.length+' '+t('photo')+'(s)':t('done_label')):t('fetching'));
+    const canExport=j.status==='done'&&(j.filename||(j.photos&&j.photos.length));
+    const checkbox=canExport?`<label style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--muted)"><input type="checkbox" style="width:auto" ${selectedForExport.has(j.id)?'checked':''} onchange="toggleSelect('${j.id}',this.checked)"> ${t('select_export')}</label>`:'';
     return `<div class="job">
       <div class="t">${title}</div>
       <div class="u">${esc(j.url||'')}</div>
@@ -992,7 +1162,10 @@ function render(list){
       <div class="bar ${cls}"><i style="width:${pct}%"></i></div>
       <div class="controls" style="justify-content:space-between;margin-top:2px">
         <span class="st ${j.status}">${j.status}${(j.status==='downloading'||j.status==='queued')?' · '+pct+'%':''}${j.size?' · '+fmtSize(j.size):''}</span>
-        <button class="btn ghost" style="padding:5px 10px;font-size:12px;margin-left:0" onclick="del('${j.id}')">${t('remove')}</button>
+        <div style="display:flex;align-items:center;gap:10px">
+          ${checkbox}
+          <button class="btn ghost" style="padding:5px 10px;font-size:12px;margin-left:0" onclick="del('${j.id}')">${t('remove')}</button>
+        </div>
       </div>
       ${j.error?`<div class="err">${esc(j.error)}</div>`:''}
       ${j.status==='done'?doneExtra(j):''}
@@ -1006,8 +1179,9 @@ function doneExtra(j){
   const photos=(j.photos&&j.photos.length)?`<div class="subrow">${t('photos_prefix')} ${j.photos.map((p,i)=>`<a class="subdl" href="/api/jobs/${j.id}/photo/${i}">${t('photo')} ${i+1}</a>`).join('')}</div>`:'';
   const tags=(m.hashtags&&m.hashtags.length)?`<div class="tags">${m.hashtags.map(h=>'#'+esc(h)).join(' ')}</div>`:'';
   const subs=(j.subs&&j.subs.length)?`<div class="subrow">${t('captions_prefix')} ${j.subs.map((s,i)=>`<a class="subdl" href="/api/jobs/${j.id}/sub/${i}">${esc(subLabel(s))}</a>`).join('')}</div>`:'';
+  const dup=(j.duplicate&&j.duplicate.title)?`<div class="meta" style="color:var(--accent)">${t('duplicate_note')} "${esc(j.duplicate.title)}"${j.duplicate.uploader?' ('+esc(j.duplicate.uploader)+')':''}</div>`:'';
   const desc=m.description?`<div style="margin-top:7px"><span class="subdl" data-desc="${esc(m.description)}" onclick="copyDesc(this)">${t('copy_desc')}</span></div>`:'';
-  return save+photos+tags+subs+desc;
+  return save+photos+tags+subs+dup+desc;
 }
 async function del(id){await fetch('/api/jobs/'+id+'/delete',{method:'POST'});poll();}
 async function poll(){
