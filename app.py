@@ -28,7 +28,8 @@ hostnames; empty = allow all), MAX_FILE_SIZE_MB (default 2048),
 YTDLP_MAX_RETRIES / YTDLP_RETRY_BACKOFF_SEC (default 2 retries, 5s backoff),
 REDIS_HOST / REDIS_PORT / REDIS_DB (default localhost:6379/0),
 RQ_QUEUE_NAME (default video-downloader), RQ_JOB_TIMEOUT_SEC.
-Needs on the server: python3, ffmpeg, yt-dlp, and redis-server.
+Needs on the server: python3, ffmpeg, yt-dlp, redis-server, and (optional,
+for photo/gallery posts yt-dlp can't parse) gallery-dl.
 """
 import os, re, json, time, uuid, shutil, socket, ipaddress, sqlite3, threading, subprocess, zipfile
 from flask import (Flask, request, jsonify,
@@ -41,6 +42,8 @@ FILE_TTL_MIN        = int(os.environ.get("FILE_TTL_MIN", "60"))
 YTDLP               = shutil.which("yt-dlp") or "yt-dlp"
 FFMPEG              = shutil.which("ffmpeg") or "ffmpeg"
 FFPROBE             = shutil.which("ffprobe") or "ffprobe"
+GALLERYDL           = shutil.which("gallery-dl")  # optional: fallback for photo/gallery posts yt-dlp can't parse
+GALLERYDL_TIMEOUT_SEC = int(os.environ.get("GALLERYDL_TIMEOUT_SEC", "300"))
 WATERMARK_TIMEOUT_SEC = int(os.environ.get("WATERMARK_TIMEOUT_SEC", "300"))
 MAX_URLS_PER_REQUEST = int(os.environ.get("MAX_URLS_PER_REQUEST", "10"))
 DOWNLOAD_TIMEOUT_SEC = int(os.environ.get("DOWNLOAD_TIMEOUT_SEC", "1800"))
@@ -107,6 +110,38 @@ def classify_outdir(outdir):
     videos = [f for f in content if f.lower().endswith(VIDEO_EXTS)]
     audios = [f for f in content if f.lower().endswith(AUDIO_EXTS)]
     return images, videos, audios
+
+def try_gallerydl_fallback(url, outdir):
+    """Best-effort fallback for photo/gallery posts yt-dlp's TikTok extractor
+    doesn't recognize (e.g. /photo/ slideshow URLs). gallery-dl nests output
+    in extractor/user subdirectories; flatten anything it produced into
+    outdir directly so classify_outdir() finds it."""
+    if not GALLERYDL:
+        return False
+    cmd = [GALLERYDL, "-o", "base-directory=%s" % outdir, url]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=GALLERYDL_TIMEOUT_SEC)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    if proc.returncode != 0:
+        return False
+    moved = False
+    for root, _dirs, files in os.walk(outdir):
+        if root == outdir:
+            continue
+        for f in files:
+            src = os.path.join(root, f)
+            dst = os.path.join(outdir, f)
+            if os.path.exists(dst):
+                base, ext = os.path.splitext(f)
+                dst = os.path.join(outdir, "%s_%s%s" % (base, uuid.uuid4().hex[:6], ext))
+            shutil.move(src, dst)
+            moved = True
+    for root, _dirs, _files in os.walk(outdir, topdown=False):
+        if root != outdir and not os.listdir(root):
+            os.rmdir(root)
+    return moved
 
 # ── db ──────────────────────────────────────────────────────────────────────
 def db():
@@ -385,6 +420,12 @@ def run_job(job_id):
                 job["status"] = "retrying"
                 time.sleep(YTDLP_RETRY_BACKOFF_SEC)
                 job["status"] = "downloading"
+        if returncode != 0 and not timed_out:
+            # yt-dlp couldn't parse this URL at all (e.g. TikTok/Instagram
+            # photo-post slideshows) — gallery-dl has broader gallery support
+            job["status"] = "downloading"
+            if try_gallerydl_fallback(job["url"], outdir):
+                returncode = 0
         if returncode != 0:
             job["status"] = "error"
             job["error"] = ("Download timed out." if timed_out else
