@@ -7,6 +7,8 @@ Adds on top of v1:
                     can search your own library later.
   • Aspect ratio  — optional ffmpeg pass to 9:16 / 1:1 / 16:9, center-crop or blurred-pad.
   • Batch audio   — paste many links, pick "Audio only (mp3)".
+  • Photo posts   — TikTok/Instagram "photo mode" slideshows are bundled
+                    (images + any background audio) into one downloadable zip.
   • Library search — /api/library?q=... over saved metadata.
   • Watermark removal — opt-in, corner-preset ffmpeg delogo pass. For YOUR OWN content
                     only (e.g. cross-posting your own video to another platform without
@@ -28,7 +30,7 @@ REDIS_HOST / REDIS_PORT / REDIS_DB (default localhost:6379/0),
 RQ_QUEUE_NAME (default video-downloader), RQ_JOB_TIMEOUT_SEC.
 Needs on the server: python3, ffmpeg, yt-dlp, and redis-server.
 """
-import os, re, json, time, uuid, shutil, socket, ipaddress, sqlite3, threading, subprocess
+import os, re, json, time, uuid, shutil, socket, ipaddress, sqlite3, threading, subprocess, zipfile
 from flask import (Flask, request, jsonify,
                    send_file, render_template_string, abort)
 import redis as redis_lib
@@ -90,6 +92,21 @@ WATERMARK_PRESETS = {
     "tl": {"x": 0.02, "y": 0.04, "w": 0.22, "h": 0.16},
     "tr": {"x": 0.76, "y": 0.04, "w": 0.22, "h": 0.16},
 }
+
+# TikTok/Instagram "photo mode" posts are a slideshow of images (+ optional
+# background audio) rather than a single video stream.
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".m4v")
+AUDIO_EXTS = (".mp3", ".m4a", ".aac", ".opus", ".ogg", ".wav")
+SKIP_EXTS = (".part", ".info.json", ".srt", ".vtt")
+
+def classify_outdir(outdir):
+    files = os.listdir(outdir)
+    content = [f for f in files if not f.endswith(SKIP_EXTS)]
+    images = sorted(f for f in content if f.lower().endswith(IMAGE_EXTS))
+    videos = [f for f in content if f.lower().endswith(VIDEO_EXTS)]
+    audios = [f for f in content if f.lower().endswith(AUDIO_EXTS)]
+    return images, videos, audios
 
 # ── db ──────────────────────────────────────────────────────────────────────
 def db():
@@ -344,7 +361,7 @@ def run_job(job_id):
     outdir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(outdir, exist_ok=True)
     fmt = FORMATS.get(job["format"], FORMATS["1080"])
-    outtmpl = os.path.join(outdir, "%(title).150B.%(ext)s")
+    outtmpl = os.path.join(outdir, "%(title).120B%(playlist_index&_{0}|)s.%(ext)s")
     cmd = [YTDLP, "-f", fmt, "-o", outtmpl, "--no-playlist", "--newline",
            "--restrict-filenames", "--no-mtime", "--no-progress",
            "--write-info-json", "--embed-metadata",
@@ -376,33 +393,48 @@ def run_job(job_id):
                             "%dMB size cap." % (attempts, MAX_FILE_SIZE_MB))
             return
 
-        media = [f for f in os.listdir(outdir)
-                 if not f.endswith((".part", ".info.json", ".webp", ".jpg", ".png", ".srt", ".vtt"))]
-        if not media:
-            job["status"] = "error"
-            job["error"] = "No file was produced."
-            return
-        media.sort(key=lambda f: os.path.getsize(os.path.join(outdir, f)), reverse=True)
-        primary = os.path.join(outdir, media[0])
+        images, videos, audios = classify_outdir(outdir)
+        is_slideshow = len(images) >= 2 and not videos
 
-        # optional watermark removal (your own content only; video only)
-        wm_pos = job.get("watermark_pos")
-        if job.get("watermark") and wm_pos in WATERMARK_PRESETS and job["format"] != "audio":
-            job["status"] = "watermarking"
-            base = os.path.splitext(media[0])[0]
-            dst = os.path.join(outdir, "%s.nowm.mp4" % base)
-            if remove_watermark(primary, dst, WATERMARK_PRESETS[wm_pos]) and os.path.exists(dst):
-                primary = dst
+        if is_slideshow:
+            # TikTok/Instagram "photo mode" post: bundle images (+ any audio
+            # track) into one zip so the existing single-file-per-job
+            # download flow keeps working unchanged.
+            job["status"] = "packaging"
+            zip_path = os.path.join(outdir, "slideshow.zip")
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in images + audios:
+                    zf.write(os.path.join(outdir, f), arcname=f)
+            primary = zip_path
+        else:
+            media = videos + audios
+            if not media:
+                media = [f for f in os.listdir(outdir) if not f.endswith(SKIP_EXTS)]
+            if not media:
+                job["status"] = "error"
+                job["error"] = "No file was produced."
+                return
+            media.sort(key=lambda f: os.path.getsize(os.path.join(outdir, f)), reverse=True)
+            primary = os.path.join(outdir, media[0])
 
-        # optional aspect-ratio conversion (video only)
-        ratio = job.get("convert")
-        if ratio in CANVAS and job["format"] != "audio":
-            job["status"] = "converting"
-            base = os.path.splitext(media[0])[0]
-            dst = os.path.join(outdir, "%s.%s.mp4" % (base, ratio))
-            rc = convert_aspect(primary, dst, ratio, job.get("convert_mode", "blur"))
-            if rc == 0 and os.path.exists(dst):
-                primary = dst
+            # optional watermark removal (your own content only; video only)
+            wm_pos = job.get("watermark_pos")
+            if job.get("watermark") and wm_pos in WATERMARK_PRESETS and job["format"] != "audio":
+                job["status"] = "watermarking"
+                base = os.path.splitext(media[0])[0]
+                dst = os.path.join(outdir, "%s.nowm.mp4" % base)
+                if remove_watermark(primary, dst, WATERMARK_PRESETS[wm_pos]) and os.path.exists(dst):
+                    primary = dst
+
+            # optional aspect-ratio conversion (video only)
+            ratio = job.get("convert")
+            if ratio in CANVAS and job["format"] != "audio":
+                job["status"] = "converting"
+                base = os.path.splitext(media[0])[0]
+                dst = os.path.join(outdir, "%s.%s.mp4" % (base, ratio))
+                rc = convert_aspect(primary, dst, ratio, job.get("convert_mode", "blur"))
+                if rc == 0 and os.path.exists(dst):
+                    primary = dst
 
         job["file"] = primary
         job["filename"] = os.path.basename(primary)
@@ -579,7 +611,7 @@ textarea:focus,input:focus,select:focus{outline:none;border-color:#F6A73B;box-sh
 .bar.done>i{background:#35D6A0;width:100%}
 .bar.error>i{background:#F2627E;width:100%}
 .st{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:#7C8AA8}
-.st.done{color:#35D6A0}.st.error{color:#F2627E}.st.downloading,.st.converting,.st.retrying,.st.watermarking{color:#F6A73B}
+.st.done{color:#35D6A0}.st.error{color:#F2627E}.st.downloading,.st.converting,.st.retrying,.st.watermarking,.st.packaging{color:#F6A73B}
 .err{color:#F2627E;font-size:12px;margin-top:4px}
 a.dl{display:inline-block;margin-top:8px;background:#35D6A0;color:#04231a;font-weight:700;
  font-size:13px;padding:8px 14px;border-radius:9px;text-decoration:none}
@@ -701,7 +733,7 @@ async function del(id){await fetch('/api/jobs/'+id+'/delete',{method:'POST'});po
 async function poll(){
   try{const r=await fetch('/api/jobs');
     const d=await r.json();render(d.jobs||[]);
-    if((d.jobs||[]).some(j=>['downloading','queued','converting','retrying','watermarking'].includes(j.status))) setTimeout(poll,1500);
+    if((d.jobs||[]).some(j=>['downloading','queued','converting','retrying','watermarking','packaging'].includes(j.status))) setTimeout(poll,1500);
   }catch(e){setTimeout(poll,3000);}
 }
 async function search(){
