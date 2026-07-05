@@ -115,9 +115,12 @@ _rate_lock = threading.Lock()
 _rate_hits = {}
 
 FORMATS = {
-    "1080": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-    "720":  "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-    "best": "bestvideo+bestaudio/best",
+    # Prefer m4a/AAC audio over the default (often Opus) pick: Opus muxed into
+    # an MP4 container plays back silent/unsupported on plenty of players even
+    # though the audio stream is technically present. m4a is natively MP4-safe.
+    "1080": "bestvideo[height<=1080]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+    "720":  "bestvideo[height<=720]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+    "best": "bestvideo+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
     "audio": "bestaudio/best",
 }
 CANVAS = {"9x16": (720, 1280), "1x1": (720, 720), "16x9": (1280, 720)}
@@ -1342,9 +1345,24 @@ function doneExtra(j){
   return save+photos+tags+subs+dup+desc;
 }
 async function del(id){await fetch('/api/jobs/'+id+'/delete',{method:'POST'});poll();}
+let autoDownloaded=new Set();
+function maybeAutoDownload(list){
+  for(const j of list){
+    if(j.status==='done'&&j.filename&&!autoDownloaded.has(j.id)){
+      autoDownloaded.add(j.id);
+      const a=document.createElement('a');
+      a.href='/api/jobs/'+j.id+'/file';
+      a.download=j.filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+  }
+}
 async function poll(){
   try{const r=await fetch('/api/jobs');
     const d=await r.json();lastJobs=d.jobs||[];render(lastJobs);
+    maybeAutoDownload(lastJobs);
     if(lastJobs.some(j=>['downloading','queued','converting','retrying','watermarking','packaging','captioning','cleaning'].includes(j.status))) setTimeout(poll,1500);
   }catch(e){setTimeout(poll,3000);}
 }
