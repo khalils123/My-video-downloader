@@ -25,6 +25,10 @@ Adds on top of v1:
                     `pip install openai-whisper` in the venv if you want this feature.
   • Trimming      — optional start/end timecodes (mm:ss); yt-dlp pulls just that
                     section via --download-sections where the source site supports it.
+  • Playlist/channel import — opt-in checkbox; expands a playlist/channel URL into
+                    up to MAX_PLAYLIST_ITEMS individual video jobs via yt-dlp
+                    --flat-playlist. Falls back to the original URL untouched
+                    when it isn't a playlist or expansion fails.
 
 Jobs are queued via Redis/RQ (see worker.py) instead of in-process threads,
 so job state survives a web-process restart/redeploy and concurrency is
@@ -47,7 +51,8 @@ REDIS_HOST / REDIS_PORT / REDIS_DB (default localhost:6379/0),
 RQ_QUEUE_NAME (default video-downloader), RQ_JOB_TIMEOUT_SEC,
 PREVIEW_TIMEOUT_SEC (default 20), MAX_EXPORT_JOBS (default 20),
 GALLERYDL_TIMEOUT_SEC (default 300), WHISPER_MODEL (default "base"),
-BURN_CAPTIONS_TIMEOUT_SEC (default 900).
+BURN_CAPTIONS_TIMEOUT_SEC (default 900), MAX_PLAYLIST_ITEMS (default 25),
+PLAYLIST_TIMEOUT_SEC (default 30).
 Needs on the server: python3, ffmpeg, yt-dlp, redis-server, and (optional)
 gallery-dl (photo/gallery posts yt-dlp can't parse) and openai-whisper
 (caption burn-in — not installed by default, pulls in torch).
@@ -93,6 +98,8 @@ YTDLP_MAX_RETRIES   = int(os.environ.get("YTDLP_MAX_RETRIES", "2"))
 YTDLP_RETRY_BACKOFF_SEC = int(os.environ.get("YTDLP_RETRY_BACKOFF_SEC", "5"))
 PREVIEW_TIMEOUT_SEC = int(os.environ.get("PREVIEW_TIMEOUT_SEC", "20"))
 MAX_EXPORT_JOBS     = int(os.environ.get("MAX_EXPORT_JOBS", "20"))
+MAX_PLAYLIST_ITEMS  = int(os.environ.get("MAX_PLAYLIST_ITEMS", "25"))
+PLAYLIST_TIMEOUT_SEC = int(os.environ.get("PLAYLIST_TIMEOUT_SEC", "30"))
 REDIS_HOST          = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT          = int(os.environ.get("REDIS_PORT", "6379"))
 REDIS_DB            = int(os.environ.get("REDIS_DB", "0"))
@@ -157,6 +164,25 @@ def parse_timecode(s):
     for p in parts:
         seconds = seconds * 60 + int(p)
     return seconds
+
+def expand_playlist_urls(url):
+    """Best-effort: if `url` points at a playlist/channel, return up to
+    MAX_PLAYLIST_ITEMS individual video URLs from it. Falls back to [url]
+    when it isn't a playlist, or expansion fails/times out."""
+    cmd = [YTDLP, "--flat-playlist", "--skip-download", "--no-warnings",
+           "--playlist-end", str(MAX_PLAYLIST_ITEMS), "--print", "%(webpage_url)s", url]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=PLAYLIST_TIMEOUT_SEC)
+    except (subprocess.TimeoutExpired, OSError):
+        return [url]
+    found = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line and line not in found:
+            found.append(line)
+        if len(found) >= MAX_PLAYLIST_ITEMS:
+            break
+    return found if found else [url]
 
 def classify_outdir(outdir):
     files = os.listdir(outdir)
@@ -815,6 +841,7 @@ def submit():
         return jsonify({"error": "Server storage is full. Try again later."}), 507
     data = request.get_json(silent=True) or {}
     urls = (data.get("urls") or [])[:MAX_URLS_PER_REQUEST]
+    expand_playlist = bool(data.get("expand_playlist"))
     fmt = data.get("format", "1080")
     if fmt not in FORMATS:
         fmt = "1080"
@@ -831,11 +858,22 @@ def submit():
     trim_end = parse_timecode(data.get("trim_end"))
     if trim_start is not None and trim_end is not None and trim_start >= trim_end:
         return jsonify({"error": "Trim start must be before trim end."}), 400
-    created = []
+    resolved_urls = []
     for u in urls:
         u = (u or "").strip()
         if not re.match(r"^https?://", u):
             continue
+        if not is_safe_url(u) or not domain_allowed(u):
+            continue
+        if expand_playlist:
+            resolved_urls.extend(expand_playlist_urls(u))
+        else:
+            resolved_urls.append(u)
+    if expand_playlist:
+        resolved_urls = resolved_urls[:MAX_PLAYLIST_ITEMS]
+
+    created = []
+    for u in resolved_urls:
         if not is_safe_url(u) or not domain_allowed(u):
             continue
         jid = uuid.uuid4().hex[:12]
@@ -1127,6 +1165,7 @@ APP_HTML = """<!doctype html><html><head><meta charset="utf-8">
    </select>
    <label style="display:flex;align-items:center;gap:6px;margin-left:2px"><input type="checkbox" id="burncc" style="width:auto;accent-color:#F6A73B"> <span data-i18n="burn_captions_label">Auto-burn captions (Whisper)</span></label>
    <label style="display:flex;align-items:center;gap:6px;margin-left:2px"><input type="checkbox" id="stripmeta" style="width:auto;accent-color:#F6A73B"> <span data-i18n="strip_metadata_label">Strip metadata (privacy)</span></label>
+   <label style="display:flex;align-items:center;gap:6px;margin-left:2px"><input type="checkbox" id="expandpl" style="width:auto;accent-color:#F6A73B"> <span data-i18n="expand_playlist_label">Import playlist/channel (all videos)</span></label>
    <label data-i18n="trim_label">Trim</label>
    <input id="trimstart" data-i18n-ph="trim_start_ph" placeholder="Start (mm:ss)" style="width:110px">
    <input id="trimend" data-i18n-ph="trim_end_ph" placeholder="End (mm:ss)" style="width:110px">
@@ -1187,7 +1226,8 @@ const STRINGS={
   sort_newest:'Newest',sort_views:'Most viewed',sort_likes:'Most liked',export_csv:'Export CSV',
   hashtags_heading:'Trending in your library:',burn_captions_label:'Auto-burn captions (Whisper)',
   strip_metadata_label:'Strip metadata (privacy)',
-  trim_label:'Trim',trim_start_ph:'Start (mm:ss)',trim_end_ph:'End (mm:ss)',trim_error:'Trim start must be before trim end.'},
+  trim_label:'Trim',trim_start_ph:'Start (mm:ss)',trim_end_ph:'End (mm:ss)',trim_error:'Trim start must be before trim end.',
+  expand_playlist_label:'Import playlist/channel (all videos)'},
  ur:{eyebrow:'ذاتی کیپچر',title:'ویڈیو کیپچر',
   banner:'صرف اپنے یا لائسنس یافتہ مواد کے لیے — آپ کی اپنی اپلوڈز، کلائنٹ یا پروڈکٹ فوٹیج، اور پبلک ڈومین / کریئیٹو کامنز مواد۔ واٹر مارک ہٹانا صرف آپ کے اپنے مواد کے لیے ہے۔',
   urls_ph:'ایک یا زیادہ لنکس پیسٹ کریں، ہر لائن میں ایک…',quality:'کوالٹی',fmt_1080:'1080p تک',fmt_720:'720p تک',fmt_best:'بہترین',fmt_audio:'صرف آڈیو (mp3)',
@@ -1204,7 +1244,8 @@ const STRINGS={
   sort_newest:'تازہ ترین',sort_views:'زیادہ دیکھی گئی',sort_likes:'زیادہ پسند کی گئی',export_csv:'CSV برآمد کریں',
   hashtags_heading:'آپ کی لائبریری میں رجحان ساز:',burn_captions_label:'خودکار کیپشنز جلائیں (Whisper)',
   strip_metadata_label:'میٹا ڈیٹا ہٹائیں (پرائیویسی)',
-  trim_label:'ٹرم',trim_start_ph:'شروع (mm:ss)',trim_end_ph:'اختتام (mm:ss)',trim_error:'ٹرم کا آغاز اختتام سے پہلے ہونا چاہیے۔'}
+  trim_label:'ٹرم',trim_start_ph:'شروع (mm:ss)',trim_end_ph:'اختتام (mm:ss)',trim_error:'ٹرم کا آغاز اختتام سے پہلے ہونا چاہیے۔',
+  expand_playlist_label:'پلے لسٹ/چینل درآمد کریں (تمام ویڈیوز)'}
 };
 let LANG=localStorage.getItem('lang')||'en';
 function t(key){return (STRINGS[LANG]&&STRINGS[LANG][key])||STRINGS.en[key]||key;}
@@ -1283,7 +1324,7 @@ async function submit(){
   $('#submitErr').textContent='';
   try{
     const r=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({urls,format:$('#fmt').value,convert:$('#conv').value,convert_mode:$('#cmode').value,captions:$('#caps').checked,watermark:$('#wm').checked,watermark_pos:$('#wmpos').value,burn_captions:$('#burncc').checked,strip_metadata:$('#stripmeta').checked,trim_start:$('#trimstart').value,trim_end:$('#trimend').value})});
+      body:JSON.stringify({urls,format:$('#fmt').value,convert:$('#conv').value,convert_mode:$('#cmode').value,captions:$('#caps').checked,watermark:$('#wm').checked,watermark_pos:$('#wmpos').value,burn_captions:$('#burncc').checked,strip_metadata:$('#stripmeta').checked,expand_playlist:$('#expandpl').checked,trim_start:$('#trimstart').value,trim_end:$('#trimend').value})});
     if(!r.ok){
       const d=await r.json().catch(()=>({}));
       $('#submitErr').textContent=d.error||'Something went wrong. Please try again.';

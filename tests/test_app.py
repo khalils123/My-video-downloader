@@ -2,7 +2,8 @@ import os
 import time
 import zipfile
 import io
-from unittest.mock import patch
+import subprocess
+from unittest.mock import patch, MagicMock
 
 from conftest import dispatch_and_close
 
@@ -373,3 +374,54 @@ def test_run_job_no_trim_omits_download_sections(app_module, client):
         app_module.run_job(jid)
 
     assert "--download-sections" not in captured
+
+
+# ── playlist/channel bulk import ────────────────────────────────────────────
+
+def test_expand_playlist_urls_falls_back_when_not_a_playlist(app_module):
+    fake_proc = MagicMock(stdout="", returncode=0)
+    with patch("app.subprocess.run", return_value=fake_proc):
+        assert app_module.expand_playlist_urls("https://example.com/v") == ["https://example.com/v"]
+
+
+def test_expand_playlist_urls_dedupes_and_caps(app_module):
+    urls = [f"https://example.com/v{i}" for i in range(30)]
+    stdout = "\n".join(urls + [urls[0]])  # duplicate first entry
+    fake_proc = MagicMock(stdout=stdout, returncode=0)
+    with patch("app.subprocess.run", return_value=fake_proc):
+        result = app_module.expand_playlist_urls("https://example.com/channel")
+    assert len(result) == app_module.MAX_PLAYLIST_ITEMS
+    assert len(result) == len(set(result))
+    assert result == urls[:app_module.MAX_PLAYLIST_ITEMS]
+
+
+def test_expand_playlist_urls_falls_back_on_timeout(app_module):
+    with patch("app.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="yt-dlp", timeout=1)):
+        assert app_module.expand_playlist_urls("https://example.com/v") == ["https://example.com/v"]
+
+
+def test_submit_expand_playlist_creates_one_job_per_video(client, app_module):
+    expanded = ["https://example.com/v1", "https://example.com/v2", "https://example.com/v3"]
+    with patch("app.expand_playlist_urls", return_value=expanded):
+        r = client.post("/api/jobs", json={"urls": ["https://example.com/channel"],
+                                            "format": "1080", "expand_playlist": True})
+    assert r.status_code == 200
+    created = r.get_json()["created"]
+    assert len(created) == 3
+    stored_urls = {app_module.get_job_dict(jid)["url"] for jid in created}
+    assert stored_urls == set(expanded)
+
+
+def test_submit_without_expand_playlist_ignores_flag_off(client, app_module):
+    with patch("app.expand_playlist_urls") as mock_expand:
+        r = client.post("/api/jobs", json={"urls": ["https://example.com/v"], "format": "1080"})
+    mock_expand.assert_not_called()
+    assert len(r.get_json()["created"]) == 1
+
+
+def test_submit_expand_playlist_caps_total_across_seeds(client, app_module):
+    with patch("app.expand_playlist_urls",
+               return_value=[f"https://example.com/v{i}" for i in range(app_module.MAX_PLAYLIST_ITEMS)]):
+        r = client.post("/api/jobs", json={"urls": ["https://example.com/c1", "https://example.com/c2"],
+                                            "format": "1080", "expand_playlist": True})
+    assert len(r.get_json()["created"]) == app_module.MAX_PLAYLIST_ITEMS
