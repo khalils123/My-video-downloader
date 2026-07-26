@@ -305,3 +305,71 @@ def test_healthz_reports_ok(client):
     body = r.get_json()
     assert body["status"] == "ok"
     assert body["checks"]["redis"] == "ok"
+
+
+# ── video trimming ────────────────────────────────────────────────────────
+
+def test_parse_timecode(app_module):
+    assert app_module.parse_timecode("90") == 90
+    assert app_module.parse_timecode("1:30") == 90
+    assert app_module.parse_timecode("1:02:03") == 3723
+    assert app_module.parse_timecode("") is None
+    assert app_module.parse_timecode(None) is None
+    assert app_module.parse_timecode("abc") is None
+    assert app_module.parse_timecode("1:2:3:4") is None
+
+
+def test_submit_rejects_start_after_end(client):
+    r = client.post("/api/jobs", json={"urls": ["https://example.com/v"], "format": "1080",
+                                        "trim_start": "2:00", "trim_end": "1:00"})
+    assert r.status_code == 400
+
+
+def test_submit_stores_trim_range(client, app_module):
+    r = client.post("/api/jobs", json={"urls": ["https://example.com/v"], "format": "1080",
+                                        "trim_start": "0:30", "trim_end": "1:15"})
+    jid = r.get_json()["created"][0]
+    j = app_module.get_job_dict(jid)
+    assert j["trim_start"] == 30
+    assert j["trim_end"] == 75
+
+
+def test_run_job_passes_download_sections_to_ytdlp(app_module, client):
+    r = client.post("/api/jobs", json={"urls": ["https://example.com/v"], "format": "1080",
+                                        "trim_start": "0:30", "trim_end": "1:15"})
+    jid = r.get_json()["created"][0]
+    outdir = os.path.join(app_module.DOWNLOAD_DIR, jid)
+    captured = []
+
+    def fake_run_once(cmd, job):
+        captured.extend(cmd)
+        os.makedirs(outdir, exist_ok=True)
+        with open(os.path.join(outdir, "video.mp4"), "wb") as f:
+            f.write(b"x")
+        return 0, False
+
+    with patch("app._run_ytdlp_once", side_effect=fake_run_once):
+        app_module.run_job(jid)
+
+    assert "--download-sections" in captured
+    assert captured[captured.index("--download-sections") + 1] == "*30-75"
+    assert "--force-keyframes-at-cuts" in captured
+
+
+def test_run_job_no_trim_omits_download_sections(app_module, client):
+    r = client.post("/api/jobs", json={"urls": ["https://example.com/v"], "format": "1080"})
+    jid = r.get_json()["created"][0]
+    outdir = os.path.join(app_module.DOWNLOAD_DIR, jid)
+    captured = []
+
+    def fake_run_once(cmd, job):
+        captured.extend(cmd)
+        os.makedirs(outdir, exist_ok=True)
+        with open(os.path.join(outdir, "video.mp4"), "wb") as f:
+            f.write(b"x")
+        return 0, False
+
+    with patch("app._run_ytdlp_once", side_effect=fake_run_once):
+        app_module.run_job(jid)
+
+    assert "--download-sections" not in captured

@@ -29,8 +29,10 @@ def app_module(tmp_path):
     and a clean Redis DB for each test, then cleans up after."""
     m.DOWNLOAD_DIR = str(tmp_path)
     m.redis_conn.flushdb()
+    m._rate_hits.clear()
     yield m
     m.redis_conn.flushdb()
+    m._rate_hits.clear()
 
 
 @pytest.fixture
