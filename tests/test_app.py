@@ -454,3 +454,25 @@ def test_submit_expand_playlist_caps_total_across_seeds(client, app_module):
         r = client.post("/api/jobs", json={"urls": ["https://example.com/c1", "https://example.com/c2"],
                                             "format": "1080", "expand_playlist": True})
     assert len(r.get_json()["created"]) == app_module.MAX_PLAYLIST_ITEMS
+
+
+# ── cookies (YouTube anti-bot workaround) ───────────────────────────────────
+
+def test_cookies_args_empty_when_unset(app_module):
+    app_module.YTDLP_COOKIES_FILE = ""
+    assert app_module.cookies_args() == []
+
+
+def test_cookies_args_empty_when_file_missing(app_module):
+    app_module.YTDLP_COOKIES_FILE = "/nonexistent/cookies.txt"
+    assert app_module.cookies_args() == []
+
+
+def test_cookies_args_included_when_file_present(app_module, tmp_path):
+    cookie_file = tmp_path / "cookies.txt"
+    cookie_file.write_text("# Netscape HTTP Cookie File\n")
+    app_module.YTDLP_COOKIES_FILE = str(cookie_file)
+    try:
+        assert app_module.cookies_args() == ["--cookies", str(cookie_file)]
+    finally:
+        app_module.YTDLP_COOKIES_FILE = ""
