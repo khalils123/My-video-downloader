@@ -45,7 +45,7 @@ FILE_TTL_MIN (default 30), MAX_URLS_PER_REQUEST (default 10),
 DOWNLOAD_TIMEOUT_SEC (default 1800), CONVERT_TIMEOUT_SEC (default 600),
 RATE_LIMIT_MAX / RATE_LIMIT_WINDOW_SEC (default 5 per 60s per IP),
 MIN_FREE_DISK_MB (default 1024), ALLOWED_DOMAINS (comma-separated
-hostnames; empty = allow all), MAX_FILE_SIZE_MB (default 2048),
+hostnames; empty = allow all), MAX_FILE_SIZE_MB (default 4096),
 YTDLP_MAX_RETRIES / YTDLP_RETRY_BACKOFF_SEC (default 2 retries, 5s backoff),
 REDIS_HOST / REDIS_PORT / REDIS_DB (default localhost:6379/0),
 RQ_QUEUE_NAME (default video-downloader), RQ_JOB_TIMEOUT_SEC,
@@ -93,7 +93,7 @@ RATE_LIMIT_MAX       = int(os.environ.get("RATE_LIMIT_MAX", "5"))
 RATE_LIMIT_WINDOW_SEC = int(os.environ.get("RATE_LIMIT_WINDOW_SEC", "60"))
 MIN_FREE_DISK_MB    = int(os.environ.get("MIN_FREE_DISK_MB", "1024"))
 ALLOWED_DOMAINS     = [d.strip().lower() for d in os.environ.get("ALLOWED_DOMAINS", "").split(",") if d.strip()]
-MAX_FILE_SIZE_MB    = int(os.environ.get("MAX_FILE_SIZE_MB", "2048"))
+MAX_FILE_SIZE_MB    = int(os.environ.get("MAX_FILE_SIZE_MB", "4096"))
 YTDLP_MAX_RETRIES   = int(os.environ.get("YTDLP_MAX_RETRIES", "2"))
 YTDLP_RETRY_BACKOFF_SEC = int(os.environ.get("YTDLP_RETRY_BACKOFF_SEC", "5"))
 PREVIEW_TIMEOUT_SEC = int(os.environ.get("PREVIEW_TIMEOUT_SEC", "20"))
@@ -577,6 +577,7 @@ def _run_ytdlp_once(cmd, job):
                             stderr=subprocess.STDOUT, text=True, bufsize=1)
     timer = threading.Timer(DOWNLOAD_TIMEOUT_SEC, proc.kill)
     timer.start()
+    error_lines = []
     try:
         for line in proc.stdout:
             m = re.search(r"(\d{1,3}(?:\.\d)?)%", line)
@@ -585,11 +586,13 @@ def _run_ytdlp_once(cmd, job):
                     job["progress"] = min(99.0, float(m.group(1)))
                 except ValueError:
                     pass
+            if line.strip().startswith(("ERROR:", "WARNING:")):
+                error_lines.append(line.strip())
         proc.wait()
     finally:
         timed_out = not timer.is_alive()
         timer.cancel()
-    return proc.returncode, timed_out
+    return proc.returncode, timed_out, error_lines
 
 def run_job(job_id):
     """RQ task entry point. Concurrency = number of running worker.py processes."""
@@ -619,10 +622,10 @@ def run_job(job_id):
     cmd.append(job["url"])
     try:
         attempts = YTDLP_MAX_RETRIES + 1
-        returncode, timed_out = 1, False
+        returncode, timed_out, error_lines = 1, False, []
         for attempt in range(attempts):
             job["progress"] = 0.0
-            returncode, timed_out = _run_ytdlp_once(cmd, job)
+            returncode, timed_out, error_lines = _run_ytdlp_once(cmd, job)
             if returncode == 0 or timed_out:
                 break
             if attempt < attempts - 1:
@@ -637,10 +640,19 @@ def run_job(job_id):
                 returncode = 0
         if returncode != 0:
             job["status"] = "error"
-            job["error"] = ("Download timed out." if timed_out else
-                            "Download failed after %d attempt(s). The site may be unsupported, "
-                            "the link protected/expired/region-locked, or the file exceeds the "
-                            "%dMB size cap." % (attempts, MAX_FILE_SIZE_MB))
+            if timed_out:
+                job["error"] = "Download timed out."
+            else:
+                detail = error_lines[-1] if error_lines else ""
+                if "max-filesize" in detail.lower():
+                    job["error"] = "The file exceeds the %dMB size cap." % MAX_FILE_SIZE_MB
+                elif detail:
+                    job["error"] = "Download failed after %d attempt(s): %s" % (
+                        attempts, re.sub(r"^(ERROR|WARNING):\s*", "", detail))
+                else:
+                    job["error"] = ("Download failed after %d attempt(s). The site may be "
+                                    "unsupported or the link is protected/expired/region-locked."
+                                    % attempts)
             return
 
         images, videos, audios = classify_outdir(outdir)

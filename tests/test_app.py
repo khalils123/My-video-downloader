@@ -122,7 +122,7 @@ def _fake_download(app_module, outdir, files):
         for name, content in files.items():
             with open(os.path.join(outdir, name), "wb") as f:
                 f.write(content)
-        return 0, False
+        return 0, False, []
     return fake_run_once
 
 
@@ -165,13 +165,42 @@ def test_run_job_failure_sets_error(app_module, client):
     jid = r.get_json()["created"][0]
 
     def fake_fail(cmd, job):
-        return 1, False
+        return 1, False, ["ERROR: Video unavailable"]
     with patch("app._run_ytdlp_once", side_effect=fake_fail), \
          patch("app.try_gallerydl_fallback", return_value=False):
         app_module.run_job(jid)
     j = app_module.get_job_dict(jid)
     assert j["status"] == "error"
-    assert j["error"]
+    assert "Video unavailable" in j["error"]
+
+
+def test_run_job_failure_reports_generic_message_with_no_detail(app_module, client):
+    r = client.post("/api/jobs", json={"urls": ["https://example.com/bad"], "format": "1080"})
+    jid = r.get_json()["created"][0]
+
+    def fake_fail(cmd, job):
+        return 1, False, []
+    with patch("app._run_ytdlp_once", side_effect=fake_fail), \
+         patch("app.try_gallerydl_fallback", return_value=False):
+        app_module.run_job(jid)
+    j = app_module.get_job_dict(jid)
+    assert j["status"] == "error"
+    assert "unsupported" in j["error"].lower()
+
+
+def test_run_job_failure_reports_size_cap_specifically(app_module, client):
+    r = client.post("/api/jobs", json={"urls": ["https://example.com/huge"], "format": "1080"})
+    jid = r.get_json()["created"][0]
+
+    def fake_fail(cmd, job):
+        return 1, False, ["ERROR: File is larger than max-filesize (4096.0MiB > 4096MiB)"]
+    with patch("app._run_ytdlp_once", side_effect=fake_fail), \
+         patch("app.try_gallerydl_fallback", return_value=False):
+        app_module.run_job(jid)
+    j = app_module.get_job_dict(jid)
+    assert j["status"] == "error"
+    assert str(app_module.MAX_FILE_SIZE_MB) in j["error"]
+    assert "size cap" in j["error"]
 
 
 # ── duplicate detection ───────────────────────────────────────────────────
@@ -347,7 +376,7 @@ def test_run_job_passes_download_sections_to_ytdlp(app_module, client):
         os.makedirs(outdir, exist_ok=True)
         with open(os.path.join(outdir, "video.mp4"), "wb") as f:
             f.write(b"x")
-        return 0, False
+        return 0, False, []
 
     with patch("app._run_ytdlp_once", side_effect=fake_run_once):
         app_module.run_job(jid)
@@ -368,7 +397,7 @@ def test_run_job_no_trim_omits_download_sections(app_module, client):
         os.makedirs(outdir, exist_ok=True)
         with open(os.path.join(outdir, "video.mp4"), "wb") as f:
             f.write(b"x")
-        return 0, False
+        return 0, False, []
 
     with patch("app._run_ytdlp_once", side_effect=fake_run_once):
         app_module.run_job(jid)
