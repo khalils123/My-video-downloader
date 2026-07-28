@@ -32,11 +32,13 @@ def app_module(tmp_path):
     m._rate_hits.clear()
     m.SITE_USER = ""
     m.SITE_PASSWORD = ""
+    m.YTDLP_POT_PROVIDER_URL = ""
     yield m
     m.redis_conn.flushdb()
     m._rate_hits.clear()
     m.SITE_USER = ""
     m.SITE_PASSWORD = ""
+    m.YTDLP_POT_PROVIDER_URL = ""
 
 
 @pytest.fixture

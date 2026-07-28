@@ -517,3 +517,16 @@ def test_site_auth_protects_api_routes(client, app_module):
     app_module.SITE_PASSWORD = "secret"
     r = client.post("/api/jobs", json={"urls": ["https://example.com/v"], "format": "1080"})
     assert r.status_code == 401
+
+
+# ── PO token provider (cookie-free YouTube anti-bot workaround) ─────────────
+
+def test_pot_provider_args_empty_when_unset(app_module):
+    app_module.YTDLP_POT_PROVIDER_URL = ""
+    assert app_module.pot_provider_args() == []
+
+
+def test_pot_provider_args_included_when_set(app_module):
+    app_module.YTDLP_POT_PROVIDER_URL = "http://127.0.0.1:4416"
+    assert app_module.pot_provider_args() == [
+        "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416"]
