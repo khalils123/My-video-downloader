@@ -53,14 +53,17 @@ PREVIEW_TIMEOUT_SEC (default 20), MAX_EXPORT_JOBS (default 20),
 GALLERYDL_TIMEOUT_SEC (default 300), WHISPER_MODEL (default "base"),
 BURN_CAPTIONS_TIMEOUT_SEC (default 900), MAX_PLAYLIST_ITEMS (default 25),
 PLAYLIST_TIMEOUT_SEC (default 30), YTDLP_COOKIES_FILE (optional path to a
-Netscape-format cookies.txt for working around YouTube's anti-bot check).
+Netscape-format cookies.txt for working around YouTube's anti-bot check),
+SITE_USER / SITE_PASSWORD (optional shared HTTP Basic Auth credentials for
+sharing the site with a small trusted group — leave both unset for a fully
+open site; /healthz always stays exempt so uptime checks keep working).
 Needs on the server: python3, ffmpeg, yt-dlp, redis-server, and (optional)
 gallery-dl (photo/gallery posts yt-dlp can't parse) and openai-whisper
 (caption burn-in — not installed by default, pulls in torch).
 """
-import os, re, json, time, uuid, shutil, socket, ipaddress, sqlite3, threading, subprocess, hashlib, zipfile, csv, io
+import os, re, json, time, uuid, shutil, socket, ipaddress, sqlite3, threading, subprocess, hashlib, zipfile, csv, io, hmac
 from flask import (Flask, request, jsonify,
-                   send_file, render_template_string, abort)
+                   send_file, render_template_string, abort, Response)
 import redis as redis_lib
 from rq import Queue
 
@@ -101,6 +104,11 @@ MAX_FILE_SIZE_MB    = int(os.environ.get("MAX_FILE_SIZE_MB", "4096"))
 # IPs hit far more often than home IPs. Optional — leave unset to download
 # without cookies as before.
 YTDLP_COOKIES_FILE  = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
+# Shared-credential gate for sharing the site with a small trusted group
+# (not a per-user login — everyone uses the same username/password). Leave
+# both unset to keep the site fully open, as it is by default.
+SITE_USER           = os.environ.get("SITE_USER", "").strip()
+SITE_PASSWORD       = os.environ.get("SITE_PASSWORD", "").strip()
 YTDLP_MAX_RETRIES   = int(os.environ.get("YTDLP_MAX_RETRIES", "2"))
 YTDLP_RETRY_BACKOFF_SEC = int(os.environ.get("YTDLP_RETRY_BACKOFF_SEC", "5"))
 PREVIEW_TIMEOUT_SEC = int(os.environ.get("PREVIEW_TIMEOUT_SEC", "20"))
@@ -117,6 +125,23 @@ RQ_JOB_TIMEOUT_SEC  = int(os.environ.get("RQ_JOB_TIMEOUT_SEC",
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024  # 1MB: plenty for a list of URLs
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+@app.before_request
+def require_site_auth():
+    """Optional shared-credential gate (SITE_USER/SITE_PASSWORD) for sharing
+    the site with a small trusted group instead of the open internet.
+    No-op — site stays fully open — unless both are set."""
+    if not (SITE_USER and SITE_PASSWORD):
+        return None
+    if request.path == "/healthz":
+        return None
+    auth = request.authorization
+    ok = bool(auth) and hmac.compare_digest(auth.username or "", SITE_USER) \
+                     and hmac.compare_digest(auth.password or "", SITE_PASSWORD)
+    if not ok:
+        return Response("Authentication required.", 401,
+                        {"WWW-Authenticate": 'Basic realm="Private Video Capture"'})
+    return None
 DB = os.path.join(DOWNLOAD_DIR, "library.db")
 
 redis_conn = redis_lib.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)

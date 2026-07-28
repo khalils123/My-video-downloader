@@ -476,3 +476,44 @@ def test_cookies_args_included_when_file_present(app_module, tmp_path):
         assert app_module.cookies_args() == ["--cookies", str(cookie_file)]
     finally:
         app_module.YTDLP_COOKIES_FILE = ""
+
+
+# ── shared-credential site gate ──────────────────────────────────────────────
+
+def test_site_open_by_default(client):
+    assert client.get("/").status_code == 200
+
+
+def test_site_auth_blocks_without_credentials(client, app_module):
+    app_module.SITE_USER = "team"
+    app_module.SITE_PASSWORD = "secret"
+    r = client.get("/")
+    assert r.status_code == 401
+
+
+def test_site_auth_blocks_wrong_credentials(client, app_module):
+    app_module.SITE_USER = "team"
+    app_module.SITE_PASSWORD = "secret"
+    r = client.get("/", auth=("team", "wrong"))
+    assert r.status_code == 401
+
+
+def test_site_auth_allows_correct_credentials(client, app_module):
+    app_module.SITE_USER = "team"
+    app_module.SITE_PASSWORD = "secret"
+    r = client.get("/", auth=("team", "secret"))
+    assert r.status_code == 200
+
+
+def test_site_auth_exempts_healthz(client, app_module):
+    app_module.SITE_USER = "team"
+    app_module.SITE_PASSWORD = "secret"
+    r = client.get("/healthz")
+    assert r.status_code != 401
+
+
+def test_site_auth_protects_api_routes(client, app_module):
+    app_module.SITE_USER = "team"
+    app_module.SITE_PASSWORD = "secret"
+    r = client.post("/api/jobs", json={"urls": ["https://example.com/v"], "format": "1080"})
+    assert r.status_code == 401

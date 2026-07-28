@@ -30,9 +30,13 @@ def app_module(tmp_path):
     m.DOWNLOAD_DIR = str(tmp_path)
     m.redis_conn.flushdb()
     m._rate_hits.clear()
+    m.SITE_USER = ""
+    m.SITE_PASSWORD = ""
     yield m
     m.redis_conn.flushdb()
     m._rate_hits.clear()
+    m.SITE_USER = ""
+    m.SITE_PASSWORD = ""
 
 
 @pytest.fixture
