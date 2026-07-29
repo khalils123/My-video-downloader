@@ -530,3 +530,15 @@ def test_pot_provider_args_included_when_set(app_module):
     app_module.YTDLP_POT_PROVIDER_URL = "http://127.0.0.1:4416"
     assert app_module.pot_provider_args() == [
         "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416"]
+
+
+# ── outbound proxy ───────────────────────────────────────────────────────────
+
+def test_proxy_args_empty_when_unset(app_module):
+    app_module.YTDLP_PROXY_URL = ""
+    assert app_module.proxy_args() == []
+
+
+def test_proxy_args_included_when_set(app_module):
+    app_module.YTDLP_PROXY_URL = "http://user:pass@147.79.5.40:7753"
+    assert app_module.proxy_args() == ["--proxy", "http://user:pass@147.79.5.40:7753"]

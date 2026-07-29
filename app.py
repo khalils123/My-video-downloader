@@ -60,7 +60,9 @@ open site; /healthz always stays exempt so uptime checks keep working),
 YTDLP_POT_PROVIDER_URL (optional base URL of a running
 bgutil-ytdlp-pot-provider server — see README — for a cookie-free,
 account-independent fix for YouTube's "Sign in to confirm you're not a
-bot" anti-bot check).
+bot" anti-bot check), YTDLP_PROXY_URL (optional full proxy URL, e.g.
+"http://user:pass@host:port", to route yt-dlp traffic through a
+residential IP instead of this server's own).
 Needs on the server: python3, ffmpeg, yt-dlp, redis-server, and (optional)
 gallery-dl (photo/gallery posts yt-dlp can't parse) and openai-whisper
 (caption burn-in — not installed by default, pulls in torch).
@@ -115,6 +117,12 @@ YTDLP_COOKIES_FILE  = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
 # since it isn't tied to (and doesn't put at risk) any single login.
 # Optional; leave unset to skip.
 YTDLP_POT_PROVIDER_URL = os.environ.get("YTDLP_POT_PROVIDER_URL", "").strip()
+# Full proxy URL yt-dlp should route through, e.g.
+# "http://user:pass@host:port". Routes downloads through a
+# residential/static-residential IP instead of this server's own
+# (often datacenter-flagged) address. Optional; leave unset to download
+# directly as before.
+YTDLP_PROXY_URL     = os.environ.get("YTDLP_PROXY_URL", "").strip()
 # Shared-credential gate for sharing the site with a small trusted group
 # (not a per-user login — everyone uses the same username/password). Leave
 # both unset to keep the site fully open, as it is by default.
@@ -218,13 +226,18 @@ def pot_provider_args():
         return ["--extractor-args", "youtubepot-bgutilhttp:base_url=%s" % YTDLP_POT_PROVIDER_URL]
     return []
 
+def proxy_args():
+    if YTDLP_PROXY_URL:
+        return ["--proxy", YTDLP_PROXY_URL]
+    return []
+
 def expand_playlist_urls(url):
     """Best-effort: if `url` points at a playlist/channel, return up to
     MAX_PLAYLIST_ITEMS individual video URLs from it. Falls back to [url]
     when it isn't a playlist, or expansion fails/times out."""
     cmd = [YTDLP, "--flat-playlist", "--skip-download", "--no-warnings",
            "--playlist-end", str(MAX_PLAYLIST_ITEMS), "--print", "%(webpage_url)s"] + \
-          cookies_args() + pot_provider_args() + [url]
+          cookies_args() + pot_provider_args() + proxy_args() + [url]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=PLAYLIST_TIMEOUT_SEC)
     except (subprocess.TimeoutExpired, OSError):
@@ -661,7 +674,7 @@ def run_job(job_id):
     cmd = [YTDLP, "-f", fmt, "-o", outtmpl, "--no-playlist", "--newline",
            "--restrict-filenames", "--no-mtime", "--no-progress",
            "--write-info-json", "--embed-metadata",
-           "--max-filesize", "%dM" % MAX_FILE_SIZE_MB] + cookies_args() + pot_provider_args()
+           "--max-filesize", "%dM" % MAX_FILE_SIZE_MB] + cookies_args() + pot_provider_args() + proxy_args()
     if job.get("captions"):
         cmd += ["--write-subs", "--write-auto-subs", "--sub-langs", "all", "--convert-subs", "srt"]
     if job["format"] == "audio":
@@ -878,7 +891,7 @@ def preview():
     if not is_safe_url(url) or not domain_allowed(url):
         return jsonify({"error": "This URL isn't allowed"}), 400
     cmd = [YTDLP, "-j", "--no-playlist", "--skip-download", "--no-warnings"] + \
-          cookies_args() + pot_provider_args() + [url]
+          cookies_args() + pot_provider_args() + proxy_args() + [url]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=PREVIEW_TIMEOUT_SEC)
     except subprocess.TimeoutExpired:
