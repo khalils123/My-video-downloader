@@ -198,12 +198,17 @@ _rate_lock = threading.Lock()
 _rate_hits = {}
 
 FORMATS = {
-    # Prefer m4a/AAC audio over the default (often Opus) pick: Opus muxed into
-    # an MP4 container plays back silent/unsupported on plenty of players even
-    # though the audio stream is technically present. m4a is natively MP4-safe.
-    "1080": "bestvideo[height<=1080]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-    "720":  "bestvideo[height<=720]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-    "best": "bestvideo+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+    # Prefer a single pre-merged (progressive) stream first: YouTube's separate
+    # video-only/audio-only DASH streams currently hit a redirect loop / 403
+    # on many clients (see https://github.com/yt-dlp/yt-dlp/issues/12482)
+    # while progressive streams still download fine. Only fall back to the
+    # video+audio merge path if no progressive option exists at that height.
+    # Within the merge path, prefer m4a/AAC audio over the default (often
+    # Opus) pick: Opus muxed into an MP4 container plays back silent on
+    # plenty of players even though the audio stream is technically present.
+    "1080": "best[height<=1080]/bestvideo[height<=1080]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best",
+    "720":  "best[height<=720]/bestvideo[height<=720]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best",
+    "best": "best/bestvideo+bestaudio[ext=m4a]/bestvideo+bestaudio",
     "audio": "bestaudio/best",
 }
 CANVAS = {"9x16": (720, 1280), "1x1": (720, 720), "16x9": (1280, 720)}
