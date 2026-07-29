@@ -589,3 +589,26 @@ def test_run_job_rotates_proxy_across_retry_attempts(app_module, client):
         "http://user:pass@2.2.2.2:2000",
         "http://user:pass@1.1.1.1:1000",
     ]
+
+
+# ── YouTube SABR/n-challenge workaround ──────────────────────────────────────
+
+def test_youtube_client_args_defaults(app_module):
+    assert app_module.youtube_client_args() == [
+        "--extractor-args", "youtube:player_client=tv",
+        "--js-runtimes", "node",
+    ]
+
+
+def test_youtube_client_args_respects_custom_client(app_module):
+    app_module.YTDLP_PLAYER_CLIENT = "web,tv"
+    assert app_module.youtube_client_args() == [
+        "--extractor-args", "youtube:player_client=web,tv",
+        "--js-runtimes", "node",
+    ]
+
+
+def test_youtube_client_args_disabled_when_both_empty(app_module):
+    app_module.YTDLP_PLAYER_CLIENT = ""
+    app_module.YTDLP_JS_RUNTIME = ""
+    assert app_module.youtube_client_args() == []

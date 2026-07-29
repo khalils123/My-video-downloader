@@ -35,6 +35,8 @@ def app_module(tmp_path):
     m.YTDLP_POT_PROVIDER_URL = ""
     m.YTDLP_PROXY_URL = ""
     m.YTDLP_PROXY_URLS = []
+    m.YTDLP_PLAYER_CLIENT = "tv"
+    m.YTDLP_JS_RUNTIME = "node"
     yield m
     m.redis_conn.flushdb()
     m._rate_hits.clear()
@@ -43,6 +45,8 @@ def app_module(tmp_path):
     m.YTDLP_POT_PROVIDER_URL = ""
     m.YTDLP_PROXY_URL = ""
     m.YTDLP_PROXY_URLS = []
+    m.YTDLP_PLAYER_CLIENT = "tv"
+    m.YTDLP_JS_RUNTIME = "node"
 
 
 @pytest.fixture

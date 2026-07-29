@@ -64,7 +64,13 @@ bot" anti-bot check), YTDLP_PROXY_URL (optional full proxy URL, e.g.
 "http://user:pass@host:port", to route yt-dlp traffic through a
 residential IP instead of this server's own), YTDLP_PROXY_URLS (optional
 comma/newline-separated pool of proxy URLs — each retry attempt shifts
-to the next one automatically, takes priority over YTDLP_PROXY_URL).
+to the next one automatically, takes priority over YTDLP_PROXY_URL),
+YTDLP_PLAYER_CLIENT (default "tv" — the YouTube client yt-dlp requests;
+avoids the SABR streaming lockout on default web-based clients; set to
+"" to use yt-dlp's own default client selection), YTDLP_JS_RUNTIME
+(default "node" — JS runtime for yt-dlp-ejs to solve YouTube's "n"
+challenge, needs Node.js 22.6+ installed separately; set to "" to
+disable).
 Needs on the server: python3, ffmpeg, yt-dlp, redis-server, and (optional)
 gallery-dl (photo/gallery posts yt-dlp can't parse) and openai-whisper
 (caption burn-in — not installed by default, pulls in torch).
@@ -131,6 +137,15 @@ YTDLP_PROXY_URL     = os.environ.get("YTDLP_PROXY_URL", "").strip()
 # dead/blocked proxy doesn't fail the whole download — it just shifts to
 # the next one. Takes priority over the single YTDLP_PROXY_URL.
 YTDLP_PROXY_URLS    = [p.strip() for p in re.split(r"[,\n]", os.environ.get("YTDLP_PROXY_URLS", "")) if p.strip()]
+# YouTube now forces SABR streaming (no direct format URLs at all) on the
+# default web-based clients; the "tv" client still exposes real download
+# URLs, but requires solving an "n" challenge that needs a JS runtime
+# (yt-dlp-ejs + Node 22.6+) to de-throttle formats. See
+# https://github.com/yt-dlp/yt-dlp/issues/12482. Both are safe no-ops for
+# non-YouTube sites and when Node isn't installed. Set either to "" to
+# disable.
+YTDLP_PLAYER_CLIENT = os.environ.get("YTDLP_PLAYER_CLIENT", "tv").strip()
+YTDLP_JS_RUNTIME    = os.environ.get("YTDLP_JS_RUNTIME", "node").strip()
 # Shared-credential gate for sharing the site with a small trusted group
 # (not a per-user login — everyone uses the same username/password). Leave
 # both unset to keep the site fully open, as it is by default.
@@ -245,13 +260,21 @@ def proxy_for_attempt(attempt=0):
         return ["--proxy", YTDLP_PROXY_URL]
     return []
 
+def youtube_client_args():
+    args = []
+    if YTDLP_PLAYER_CLIENT:
+        args += ["--extractor-args", "youtube:player_client=%s" % YTDLP_PLAYER_CLIENT]
+    if YTDLP_JS_RUNTIME:
+        args += ["--js-runtimes", YTDLP_JS_RUNTIME]
+    return args
+
 def expand_playlist_urls(url):
     """Best-effort: if `url` points at a playlist/channel, return up to
     MAX_PLAYLIST_ITEMS individual video URLs from it. Falls back to [url]
     when it isn't a playlist, or expansion fails/times out."""
     cmd = [YTDLP, "--flat-playlist", "--skip-download", "--no-warnings",
            "--playlist-end", str(MAX_PLAYLIST_ITEMS), "--print", "%(webpage_url)s"] + \
-          cookies_args() + pot_provider_args() + proxy_for_attempt() + [url]
+          cookies_args() + pot_provider_args() + proxy_for_attempt() + youtube_client_args() + [url]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=PLAYLIST_TIMEOUT_SEC)
     except (subprocess.TimeoutExpired, OSError):
@@ -688,7 +711,7 @@ def run_job(job_id):
     base_cmd = [YTDLP, "-f", fmt, "-o", outtmpl, "--no-playlist", "--newline",
            "--restrict-filenames", "--no-mtime", "--no-progress",
            "--write-info-json", "--embed-metadata",
-           "--max-filesize", "%dM" % MAX_FILE_SIZE_MB] + cookies_args() + pot_provider_args()
+           "--max-filesize", "%dM" % MAX_FILE_SIZE_MB] + cookies_args() + pot_provider_args() + youtube_client_args()
     if job.get("captions"):
         base_cmd += ["--write-subs", "--write-auto-subs", "--sub-langs", "all", "--convert-subs", "srt"]
     if job["format"] == "audio":
@@ -905,7 +928,7 @@ def preview():
     if not is_safe_url(url) or not domain_allowed(url):
         return jsonify({"error": "This URL isn't allowed"}), 400
     cmd = [YTDLP, "-j", "--no-playlist", "--skip-download", "--no-warnings"] + \
-          cookies_args() + pot_provider_args() + proxy_for_attempt() + [url]
+          cookies_args() + pot_provider_args() + proxy_for_attempt() + youtube_client_args() + [url]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=PREVIEW_TIMEOUT_SEC)
     except subprocess.TimeoutExpired:
