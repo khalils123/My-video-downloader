@@ -534,11 +534,58 @@ def test_pot_provider_args_included_when_set(app_module):
 
 # ── outbound proxy ───────────────────────────────────────────────────────────
 
-def test_proxy_args_empty_when_unset(app_module):
+def test_proxy_for_attempt_empty_when_unset(app_module):
     app_module.YTDLP_PROXY_URL = ""
-    assert app_module.proxy_args() == []
+    app_module.YTDLP_PROXY_URLS = []
+    assert app_module.proxy_for_attempt() == []
 
 
-def test_proxy_args_included_when_set(app_module):
+def test_proxy_for_attempt_uses_single_url_when_set(app_module):
     app_module.YTDLP_PROXY_URL = "http://user:pass@147.79.5.40:7753"
-    assert app_module.proxy_args() == ["--proxy", "http://user:pass@147.79.5.40:7753"]
+    assert app_module.proxy_for_attempt() == ["--proxy", "http://user:pass@147.79.5.40:7753"]
+    # single-URL mode ignores the attempt index — same proxy every time
+    assert app_module.proxy_for_attempt(3) == ["--proxy", "http://user:pass@147.79.5.40:7753"]
+
+
+def test_proxy_for_attempt_rotates_through_pool(app_module):
+    app_module.YTDLP_PROXY_URLS = [
+        "http://user:pass@1.1.1.1:1000",
+        "http://user:pass@2.2.2.2:2000",
+        "http://user:pass@3.3.3.3:3000",
+    ]
+    assert app_module.proxy_for_attempt(0) == ["--proxy", "http://user:pass@1.1.1.1:1000"]
+    assert app_module.proxy_for_attempt(1) == ["--proxy", "http://user:pass@2.2.2.2:2000"]
+    assert app_module.proxy_for_attempt(2) == ["--proxy", "http://user:pass@3.3.3.3:3000"]
+    # wraps around past the end of the pool
+    assert app_module.proxy_for_attempt(3) == ["--proxy", "http://user:pass@1.1.1.1:1000"]
+
+
+def test_proxy_for_attempt_pool_takes_priority_over_single_url(app_module):
+    app_module.YTDLP_PROXY_URL = "http://user:pass@single.example:1000"
+    app_module.YTDLP_PROXY_URLS = ["http://user:pass@pooled.example:2000"]
+    assert app_module.proxy_for_attempt() == ["--proxy", "http://user:pass@pooled.example:2000"]
+
+
+def test_run_job_rotates_proxy_across_retry_attempts(app_module, client):
+    app_module.YTDLP_PROXY_URLS = [
+        "http://user:pass@1.1.1.1:1000",
+        "http://user:pass@2.2.2.2:2000",
+    ]
+    r = client.post("/api/jobs", json={"urls": ["https://example.com/v"], "format": "1080"})
+    jid = r.get_json()["created"][0]
+    seen_proxies = []
+
+    def fake_run_once(cmd, job):
+        seen_proxies.append(cmd[cmd.index("--proxy") + 1])
+        return 1, False, ["ERROR: proxy connection failed"]
+
+    with patch("app._run_ytdlp_once", side_effect=fake_run_once), \
+         patch("app.try_gallerydl_fallback", return_value=False), \
+         patch("app.YTDLP_RETRY_BACKOFF_SEC", 0):
+        app_module.run_job(jid)
+
+    assert seen_proxies == [
+        "http://user:pass@1.1.1.1:1000",
+        "http://user:pass@2.2.2.2:2000",
+        "http://user:pass@1.1.1.1:1000",
+    ]

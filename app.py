@@ -62,7 +62,9 @@ bgutil-ytdlp-pot-provider server — see README — for a cookie-free,
 account-independent fix for YouTube's "Sign in to confirm you're not a
 bot" anti-bot check), YTDLP_PROXY_URL (optional full proxy URL, e.g.
 "http://user:pass@host:port", to route yt-dlp traffic through a
-residential IP instead of this server's own).
+residential IP instead of this server's own), YTDLP_PROXY_URLS (optional
+comma/newline-separated pool of proxy URLs — each retry attempt shifts
+to the next one automatically, takes priority over YTDLP_PROXY_URL).
 Needs on the server: python3, ffmpeg, yt-dlp, redis-server, and (optional)
 gallery-dl (photo/gallery posts yt-dlp can't parse) and openai-whisper
 (caption burn-in — not installed by default, pulls in torch).
@@ -123,6 +125,12 @@ YTDLP_POT_PROVIDER_URL = os.environ.get("YTDLP_POT_PROVIDER_URL", "").strip()
 # (often datacenter-flagged) address. Optional; leave unset to download
 # directly as before.
 YTDLP_PROXY_URL     = os.environ.get("YTDLP_PROXY_URL", "").strip()
+# Comma/newline-separated pool of full proxy URLs, e.g.
+# "http://user:pass@ip1:port,http://user:pass@ip2:port,...". When set, each
+# retry attempt automatically moves to the next proxy in the list, so one
+# dead/blocked proxy doesn't fail the whole download — it just shifts to
+# the next one. Takes priority over the single YTDLP_PROXY_URL.
+YTDLP_PROXY_URLS    = [p.strip() for p in re.split(r"[,\n]", os.environ.get("YTDLP_PROXY_URLS", "")) if p.strip()]
 # Shared-credential gate for sharing the site with a small trusted group
 # (not a per-user login — everyone uses the same username/password). Leave
 # both unset to keep the site fully open, as it is by default.
@@ -226,7 +234,13 @@ def pot_provider_args():
         return ["--extractor-args", "youtubepot-bgutilhttp:base_url=%s" % YTDLP_POT_PROVIDER_URL]
     return []
 
-def proxy_args():
+def proxy_for_attempt(attempt=0):
+    """--proxy args for a given retry attempt index. Rotates through
+    YTDLP_PROXY_URLS (if configured) so each failed attempt automatically
+    shifts to the next proxy in the pool; falls back to the single
+    YTDLP_PROXY_URL, or no proxy at all if neither is set."""
+    if YTDLP_PROXY_URLS:
+        return ["--proxy", YTDLP_PROXY_URLS[attempt % len(YTDLP_PROXY_URLS)]]
     if YTDLP_PROXY_URL:
         return ["--proxy", YTDLP_PROXY_URL]
     return []
@@ -237,7 +251,7 @@ def expand_playlist_urls(url):
     when it isn't a playlist, or expansion fails/times out."""
     cmd = [YTDLP, "--flat-playlist", "--skip-download", "--no-warnings",
            "--playlist-end", str(MAX_PLAYLIST_ITEMS), "--print", "%(webpage_url)s"] + \
-          cookies_args() + pot_provider_args() + proxy_args() + [url]
+          cookies_args() + pot_provider_args() + proxy_for_attempt() + [url]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=PLAYLIST_TIMEOUT_SEC)
     except (subprocess.TimeoutExpired, OSError):
@@ -671,27 +685,27 @@ def run_job(job_id):
     os.makedirs(outdir, exist_ok=True)
     fmt = FORMATS.get(job["format"], FORMATS["1080"])
     outtmpl = os.path.join(outdir, "%(title).120B%(playlist_index&_{0}|)s.%(ext)s")
-    cmd = [YTDLP, "-f", fmt, "-o", outtmpl, "--no-playlist", "--newline",
+    base_cmd = [YTDLP, "-f", fmt, "-o", outtmpl, "--no-playlist", "--newline",
            "--restrict-filenames", "--no-mtime", "--no-progress",
            "--write-info-json", "--embed-metadata",
-           "--max-filesize", "%dM" % MAX_FILE_SIZE_MB] + cookies_args() + pot_provider_args() + proxy_args()
+           "--max-filesize", "%dM" % MAX_FILE_SIZE_MB] + cookies_args() + pot_provider_args()
     if job.get("captions"):
-        cmd += ["--write-subs", "--write-auto-subs", "--sub-langs", "all", "--convert-subs", "srt"]
+        base_cmd += ["--write-subs", "--write-auto-subs", "--sub-langs", "all", "--convert-subs", "srt"]
     if job["format"] == "audio":
-        cmd += ["--extract-audio", "--audio-format", "mp3"]
+        base_cmd += ["--extract-audio", "--audio-format", "mp3"]
     else:
-        cmd += ["--merge-output-format", "mp4"]
+        base_cmd += ["--merge-output-format", "mp4"]
     trim_start, trim_end = job.get("trim_start"), job.get("trim_end")
     if trim_start is not None or trim_end is not None:
         section = "*%s-%s" % (trim_start if trim_start is not None else 0,
                               trim_end if trim_end is not None else "inf")
-        cmd += ["--download-sections", section, "--force-keyframes-at-cuts"]
-    cmd.append(job["url"])
+        base_cmd += ["--download-sections", section, "--force-keyframes-at-cuts"]
     try:
         attempts = YTDLP_MAX_RETRIES + 1
         returncode, timed_out, error_lines = 1, False, []
         for attempt in range(attempts):
             job["progress"] = 0.0
+            cmd = base_cmd + proxy_for_attempt(attempt) + [job["url"]]
             returncode, timed_out, error_lines = _run_ytdlp_once(cmd, job)
             if returncode == 0 or timed_out:
                 break
@@ -891,7 +905,7 @@ def preview():
     if not is_safe_url(url) or not domain_allowed(url):
         return jsonify({"error": "This URL isn't allowed"}), 400
     cmd = [YTDLP, "-j", "--no-playlist", "--skip-download", "--no-warnings"] + \
-          cookies_args() + pot_provider_args() + proxy_args() + [url]
+          cookies_args() + pot_provider_args() + proxy_for_attempt() + [url]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=PREVIEW_TIMEOUT_SEC)
     except subprocess.TimeoutExpired:
